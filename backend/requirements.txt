@@ -9,7 +9,7 @@ langchain-google-genai==3.0.1
 google-generativeai==0.8.5
 
 # Tree-sitter for code parsing
-tree-sitter==0.25.2
+tree-sitter==0.20.4
 tree-sitter-languages==1.10.2
 
 # Vector store

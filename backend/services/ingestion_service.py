@@ -8,7 +8,9 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
+from config.settings import settings
 from services.repository_service import RepositoryService
+from services.parser_service import ParserService
 
 # Setup logger
 logger = logging.getLogger(__name__)
@@ -19,12 +21,12 @@ class IngestionService:
 
     def __init__(self):
         """Initialize ingestion service with configuration."""
-        self.temp_repos_path = Path("./temp_repos")
-        self.temp_repos_path.mkdir(exist_ok=True)
+        # Get temp_repos_path from settings
+        self.temp_repos_path = Path(settings.temp_repos_path)
+        self.temp_repos_path.mkdir(exist_ok=True, parents=True)
         
-        # TODO: Initialize parser_service when implemented
-        # from services.parser_service import ParserService
-        # self.parser_service = ParserService()
+        # Initialize parser service
+        self.parser_service = ParserService()
         
         # TODO: Initialize chunker when implemented
         # from utils.chunker import Chunker
@@ -121,7 +123,7 @@ class IngestionService:
         supported_extensions = {
             ".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".go", 
             ".cpp", ".c", ".h", ".hpp", ".cs", ".rb", ".php", 
-            ".swift", ".kt", ".rs", ".scala", ".r", ".m"
+            ".swift", ".kt", ".rs", ".scala", ".r", ".m", ".ipynb"
         }
         
         skip_dirs = {".git", "node_modules", "__pycache__", "venv", 
@@ -180,17 +182,16 @@ class IngestionService:
                 with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                     code_text = f.read()
                 
-                # TODO: Use parser_service to parse AST
-                # parsed = self.parser_service.parse_file(file_path, code_text)
+                # Use parser_service to parse AST
+                parsed = self.parser_service.parse_file(file_path, code_text, language)
                 
                 parsed_structures.append({
                     "file_path": str(relative_path),
-                    "language": language,
+                    "language": parsed.get("language", language),
                     "code_text": code_text,
-                    # TODO: Add parsed structures from parser_service
-                    # "functions": parsed.get("functions", []),
-                    # "classes": parsed.get("classes", []),
-                    # "imports": parsed.get("imports", []),
+                    "functions": parsed.get("functions", []),
+                    "classes": parsed.get("classes", []),
+                    "imports": parsed.get("imports", []),
                 })
                 
             except Exception as e:
@@ -234,30 +235,72 @@ class IngestionService:
             code_text = structure["code_text"]
             language = structure["language"]
             
-            # TODO: Use chunker to create semantic chunks
-            # For now, create simple chunks by splitting on functions/classes
-            # This is a placeholder - replace with actual chunker logic
+            # Create semantic chunks from parsed structures
+            # Chunk by functions first, then classes, then remaining code
             
-            # Simple placeholder: split by lines (will be replaced)
-            lines = code_text.split("\n")
-            chunk_size = 50  # Placeholder
+            functions = structure.get("functions", [])
+            classes = structure.get("classes", [])
+            imports = structure.get("imports", [])
             
-            for i in range(0, len(lines), chunk_size):
-                chunk_text = "\n".join(lines[i:i + chunk_size])
-                chunk_id = f"{file_path}_{chunk_counter}"
-                
+            # Chunk each function
+            for func in functions:
+                chunk_id = f"{file_path}_func_{chunk_counter}"
                 chunks.append({
                     "chunk_id": chunk_id,
                     "file_path": file_path,
-                    "function_name": None,  # TODO: Extract from parser
-                    "class_name": None,  # TODO: Extract from parser
-                    "code_text": chunk_text,
-                    "start_line": i + 1,
-                    "end_line": min(i + chunk_size, len(lines)),
+                    "function_name": func.get("name"),
+                    "class_name": None,
+                    "code_text": func.get("body", ""),
+                    "start_line": func.get("start_line", 1),
+                    "end_line": func.get("end_line", 1),
                     "language": language,
-                    "metadata": {}
+                    "metadata": {
+                        "signature": func.get("signature", ""),
+                        "type": "function"
+                    }
                 })
                 chunk_counter += 1
+            
+            # Chunk each class
+            for cls in classes:
+                chunk_id = f"{file_path}_class_{chunk_counter}"
+                chunks.append({
+                    "chunk_id": chunk_id,
+                    "file_path": file_path,
+                    "function_name": None,
+                    "class_name": cls.get("name"),
+                    "code_text": cls.get("body", ""),
+                    "start_line": cls.get("start_line", 1),
+                    "end_line": cls.get("end_line", 1),
+                    "language": language,
+                    "metadata": {
+                        "type": "class",
+                        "imports": [imp.get("text", "") for imp in imports]
+                    }
+                })
+                chunk_counter += 1
+            
+            # If no functions or classes found, chunk by lines as fallback
+            if not functions and not classes:
+                lines = code_text.split("\n")
+                chunk_size = 50
+                
+                for i in range(0, len(lines), chunk_size):
+                    chunk_text = "\n".join(lines[i:i + chunk_size])
+                    chunk_id = f"{file_path}_{chunk_counter}"
+                    
+                    chunks.append({
+                        "chunk_id": chunk_id,
+                        "file_path": file_path,
+                        "function_name": None,
+                        "class_name": None,
+                        "code_text": chunk_text,
+                        "start_line": i + 1,
+                        "end_line": min(i + chunk_size, len(lines)),
+                        "language": language,
+                        "metadata": {}
+                    })
+                    chunk_counter += 1
         
         logger.info("Created %d code chunks", len(chunks))
         return chunks

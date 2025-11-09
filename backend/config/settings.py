@@ -17,7 +17,10 @@ class Settings(BaseSettings):
     db_name: str = "codesense"
 
     # Vector Store Configuration
-    vector_store_path: str = "./vector_stores"
+    vector_store_path: str = "../vector_stores"
+
+    # Repository Processing Configuration
+    temp_repos_path: str = "../temp_repos"
 
     # Optional Configuration
     github_token: Optional[str] = None
