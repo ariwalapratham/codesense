@@ -1,4 +1,4 @@
-"""Ingestion service to orchestrate the complete pipeline: clone → parse → chunk → embed → store."""
+"""Ingestion service to orchestrate the complete pipeline: clone → parse → embed → store."""
 
 import logging
 import re
@@ -9,8 +9,9 @@ from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 from config.settings import settings
-from services.repository_service import RepositoryService
+from services.embedding_service import EmbeddingService
 from services.parser_service import ParserService
+from services.repository_service import RepositoryService
 
 # Setup logger
 logger = logging.getLogger(__name__)
@@ -28,13 +29,8 @@ class IngestionService:
         # Initialize parser service
         self.parser_service = ParserService()
         
-        # TODO: Initialize chunker when implemented
-        # from utils.chunker import Chunker
-        # self.chunker = Chunker()
-        
-        # TODO: Initialize embedding_service when implemented
-        # from services.embedding_service import EmbeddingService
-        # self.embedding_service = EmbeddingService()
+        # Initialize embedding service (handles chunking and embedding)
+        self.embedding_service = EmbeddingService()
         
         # TODO: Initialize vector_store_service when implemented
         # from services.vector_store_service import VectorStoreService
@@ -176,18 +172,17 @@ class IngestionService:
         for file_path in files:
             try:
                 relative_path = file_path.relative_to(repo_path)
-                language = file_path.suffix[1:] if file_path.suffix else "unknown"
                 
                 # Read file content
                 with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                     code_text = f.read()
                 
-                # Use parser_service to parse AST
-                parsed = self.parser_service.parse_file(file_path, code_text, language)
+                # Use parser_service to parse AST (language will be auto-detected from file extension)
+                parsed = self.parser_service.parse_file(file_path, code_text, language=None)
                 
                 parsed_structures.append({
                     "file_path": str(relative_path),
-                    "language": parsed.get("language", language),
+                    "language": parsed.get("language", "unknown"),
                     "code_text": code_text,
                     "functions": parsed.get("functions", []),
                     "classes": parsed.get("classes", []),
@@ -201,145 +196,6 @@ class IngestionService:
         logger.info("Parsed %d files", len(parsed_structures))
         return parsed_structures
 
-    def _chunk_code(self, parsed_structures: List[Dict]) -> List[Dict]:
-        """
-        Chunk parsed code into smaller pieces for embedding.
-
-        Args:
-            parsed_structures: List of parsed code structures
-
-        Returns:
-            List of code chunks with metadata
-        """
-        # TODO: Implement chunking logic using chunker
-        # - Split code by semantic boundaries (functions, classes)
-        # - Preserve context (file path, function name, imports)
-        # - Return list of dictionaries with:
-        #   {
-        #       "chunk_id": str (unique identifier),
-        #       "file_path": str,
-        #       "function_name": Optional[str],
-        #       "class_name": Optional[str],
-        #       "code_text": str,
-        #       "start_line": int,
-        #       "end_line": int,
-        #       "language": str,
-        #       "metadata": dict (additional context)
-        #   }
-        
-        chunks = []
-        chunk_counter = 0
-        
-        for structure in parsed_structures:
-            file_path = structure["file_path"]
-            code_text = structure["code_text"]
-            language = structure["language"]
-            
-            # Create semantic chunks from parsed structures
-            # Chunk by functions first, then classes, then remaining code
-            
-            functions = structure.get("functions", [])
-            classes = structure.get("classes", [])
-            imports = structure.get("imports", [])
-            
-            # Chunk each function
-            for func in functions:
-                chunk_id = f"{file_path}_func_{chunk_counter}"
-                chunks.append({
-                    "chunk_id": chunk_id,
-                    "file_path": file_path,
-                    "function_name": func.get("name"),
-                    "class_name": None,
-                    "code_text": func.get("body", ""),
-                    "start_line": func.get("start_line", 1),
-                    "end_line": func.get("end_line", 1),
-                    "language": language,
-                    "metadata": {
-                        "signature": func.get("signature", ""),
-                        "type": "function"
-                    }
-                })
-                chunk_counter += 1
-            
-            # Chunk each class
-            for cls in classes:
-                chunk_id = f"{file_path}_class_{chunk_counter}"
-                chunks.append({
-                    "chunk_id": chunk_id,
-                    "file_path": file_path,
-                    "function_name": None,
-                    "class_name": cls.get("name"),
-                    "code_text": cls.get("body", ""),
-                    "start_line": cls.get("start_line", 1),
-                    "end_line": cls.get("end_line", 1),
-                    "language": language,
-                    "metadata": {
-                        "type": "class",
-                        "imports": [imp.get("text", "") for imp in imports]
-                    }
-                })
-                chunk_counter += 1
-            
-            # If no functions or classes found, chunk by lines as fallback
-            if not functions and not classes:
-                lines = code_text.split("\n")
-                chunk_size = 50
-                
-                for i in range(0, len(lines), chunk_size):
-                    chunk_text = "\n".join(lines[i:i + chunk_size])
-                    chunk_id = f"{file_path}_{chunk_counter}"
-                    
-                    chunks.append({
-                        "chunk_id": chunk_id,
-                        "file_path": file_path,
-                        "function_name": None,
-                        "class_name": None,
-                        "code_text": chunk_text,
-                        "start_line": i + 1,
-                        "end_line": min(i + chunk_size, len(lines)),
-                        "language": language,
-                        "metadata": {}
-                    })
-                    chunk_counter += 1
-        
-        logger.info("Created %d code chunks", len(chunks))
-        return chunks
-
-    def _generate_embeddings(self, chunks: List[Dict]) -> List[Dict]:
-        """
-        Generate embeddings for code chunks.
-
-        Args:
-            chunks: List of code chunks
-
-        Returns:
-            List of chunks with embeddings added
-        """
-        # TODO: Implement embedding generation using embedding_service
-        # - Use Gemini embedding model
-        # - Process chunks in batches for efficiency
-        # - Add "embedding" field to each chunk dictionary
-        # - Return chunks with embeddings
-        
-        embedded_chunks = []
-        
-        for chunk in chunks:
-            try:
-                # TODO: Use embedding_service to generate embedding
-                # code_text = chunk["code_text"]
-                # embedding = self.embedding_service.embed_text(code_text)
-                
-                # Placeholder: will be replaced with actual embedding
-                chunk["embedding"] = None  # TODO: Replace with actual embedding vector
-                embedded_chunks.append(chunk)
-                
-            except Exception as e:
-                logger.warning("Failed to generate embedding for chunk %s: %s", 
-                             chunk.get('chunk_id'), e)
-                continue
-        
-        logger.info("Generated embeddings for %d chunks", len(embedded_chunks))
-        return embedded_chunks
 
     def _store_embeddings(self, embedded_chunks: List[Dict], repo_id: str, 
                          repo_url: str, commit_hash: Optional[str]) -> bool:  # noqa: ARG002
@@ -525,29 +381,51 @@ class IngestionService:
                     self._cleanup_temp_repo(repo_path)
                 return False, error_msg, None
             
-            # Step 7: Chunk code
-            logger.info("Chunking code...")
-            chunks = self._chunk_code(parsed_structures)
+            # Calculate parsing statistics
+            total_functions = sum(len(s.get("functions", [])) for s in parsed_structures)
+            total_classes = sum(len(s.get("classes", [])) for s in parsed_structures)
+            total_imports = sum(len(s.get("imports", [])) for s in parsed_structures)
+            languages_found = list(set(s.get("language", "unknown") for s in parsed_structures))
             
-            if not chunks:
-                error_msg = "Failed to create code chunks"
-                logger.error(error_msg)
-                if cleanup:
-                    self._cleanup_temp_repo(repo_path)
-                return False, error_msg, None
+            metadata["parsing_stats"] = {
+                "files_parsed": len(parsed_structures),
+                "total_functions": total_functions,
+                "total_classes": total_classes,
+                "total_imports": total_imports,
+                "languages": languages_found
+            }
             
-            metadata["chunks_processed"] = len(chunks)
+            logger.info(
+                "Parsing complete: %d files, %d functions, %d classes, %d imports",
+                len(parsed_structures), total_functions, total_classes, total_imports
+            )
             
-            # Step 8: Generate embeddings
-            logger.info("Generating embeddings...")
-            embedded_chunks = self._generate_embeddings(chunks)
+            # Step 7: Chunk code and generate embeddings
+            logger.info("Chunking code and generating embeddings...")
+            embedded_chunks = self.embedding_service.chunk_and_embed(
+                parsed_structures,
+                batch_size=10  # Process 10 chunks at a time for embeddings
+            )
             
             if not embedded_chunks:
-                error_msg = "Failed to generate embeddings"
+                error_msg = "Failed to chunk code and generate embeddings"
                 logger.error(error_msg)
                 if cleanup:
                     self._cleanup_temp_repo(repo_path)
                 return False, error_msg, None
+            
+            # Count chunks with successful embeddings
+            chunks_with_embeddings = sum(
+                1 for chunk in embedded_chunks
+                if chunk.get("embedding") is not None
+            )
+            metadata["chunks_processed"] = len(embedded_chunks)
+            metadata["chunks_with_embeddings"] = chunks_with_embeddings
+            
+            logger.info(
+                "Created %d chunks, %d with embeddings",
+                len(embedded_chunks), chunks_with_embeddings
+            )
             
             # Step 9: Store embeddings and metadata
             logger.info("Storing embeddings and metadata...")
@@ -575,12 +453,13 @@ class IngestionService:
                 "status": "completed",
                 "repo_id": repo_id,
                 "owner": owner,
-                "repo_name": repo_name
+                "repo_name": repo_name,
+                "repo_path": str(repo_path) if repo_path else None
             })
             
             success_msg = (
                 f"Successfully ingested repository {repo_id}. "
-                f"Processed {len(code_files)} files and created {len(chunks)} chunks."
+                f"Processed {len(code_files)} files and created {len(embedded_chunks)} chunks."
             )
             logger.info(success_msg)
             

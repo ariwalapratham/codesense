@@ -8,7 +8,7 @@ class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
 
     # Gemini Configuration
-    gemini_api_key: str
+    gemini_api_key: Optional[str] = None
     gemini_embedding_model: str = "models/embedding-001"
     gemini_llm_model: str = "gemini-pro"
 
