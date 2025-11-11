@@ -3,6 +3,7 @@
 import logging
 from typing import Dict, List, Optional
 
+import numpy as np
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 try:
@@ -418,26 +419,83 @@ class EmbeddingService:
                         content=batch_texts,
                         task_type="retrieval_document"
                     )
-                    # Handle batch response - can be dict with 'embeddings' key or list
+                    # Handle batch response format
+                    # Gemini API returns different formats:
+                    # - Single text: {"embedding": [...]}
+                    # - Batch: {"embeddings": [{"embedding": [...]}, ...]} or list of dicts
+                    embedding_list = []
+                    
                     if isinstance(result, dict):
                         if "embeddings" in result:
-                            embedding_list = [emb.get("embedding", []) for emb in result["embeddings"]]
+                            # Batch response with 'embeddings' key
+                            embeddings_data = result["embeddings"]
+                            if isinstance(embeddings_data, list):
+                                embedding_list = [
+                                    emb.get("embedding", []) if isinstance(emb, dict) else emb
+                                    for emb in embeddings_data
+                                ]
+                            else:
+                                logger.warning("Unexpected 'embeddings' format in batch response")
+                                embedding_list = []
                         elif "embedding" in result:
+                            # Single embedding in dict (shouldn't happen for batch, but handle it)
                             embedding_list = [result["embedding"]]
                         else:
+                            logger.warning("No 'embedding' or 'embeddings' key in response dict")
                             embedding_list = []
                     elif isinstance(result, list):
+                        # Direct list of embeddings or dicts
                         embedding_list = [
                             emb.get("embedding", []) if isinstance(emb, dict) else emb
                             for emb in result
                         ]
                     else:
+                        logger.warning("Unexpected response type: %s", type(result))
                         embedding_list = []
+                    
+                    # Validate we got the expected number of embeddings
+                    if len(embedding_list) != len(batch_texts):
+                        logger.warning(
+                            "Mismatch in embedding count: expected %d, got %d",
+                            len(batch_texts), len(embedding_list)
+                        )
 
-                # Attach embeddings to chunks
+                # Attach embeddings to chunks with validation
                 for idx, chunk in enumerate(batch):
                     if idx < len(embedding_list) and embedding_list[idx]:
-                        chunk["embedding"] = embedding_list[idx]
+                        embedding = embedding_list[idx]
+                        
+                        # Validate embedding format and content
+                        if not isinstance(embedding, (list, np.ndarray)):
+                            logger.warning(
+                                "Invalid embedding type for chunk %s: %s",
+                                chunk.get("chunk_id"), type(embedding)
+                            )
+                            chunk["embedding"] = None
+                            embedded_chunks.append(chunk)
+                            continue
+                        
+                        # Convert to numpy array for validation
+                        embedding_array = np.array(embedding, dtype=np.float32)
+                        
+                        # Validate embedding (check for NaN/Inf)
+                        if np.any(np.isnan(embedding_array)) or np.any(np.isinf(embedding_array)):
+                            logger.warning(
+                                "Invalid embedding detected (NaN/Inf) for chunk %s, skipping",
+                                chunk.get("chunk_id")
+                            )
+                            chunk["embedding"] = None
+                            embedded_chunks.append(chunk)
+                            continue
+                        
+                        # Check embedding dimension
+                        if len(embedding_array) != 768:
+                            logger.warning(
+                                "Unexpected embedding dimension %d (expected 768) for chunk %s",
+                                len(embedding_array), chunk.get("chunk_id")
+                            )
+                        
+                        chunk["embedding"] = embedding
                         embedded_chunks.append(chunk)
                     else:
                         logger.warning(

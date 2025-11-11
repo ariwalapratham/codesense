@@ -12,6 +12,7 @@ from config.settings import settings
 from services.embedding_service import EmbeddingService
 from services.parser_service import ParserService
 from services.repository_service import RepositoryService
+from services.vector_store_service import VectorStoreService
 
 # Setup logger
 logger = logging.getLogger(__name__)
@@ -32,9 +33,8 @@ class IngestionService:
         # Initialize embedding service (handles chunking and embedding)
         self.embedding_service = EmbeddingService()
         
-        # TODO: Initialize vector_store_service when implemented
-        # from services.vector_store_service import VectorStoreService
-        # self.vector_store_service = VectorStoreService()
+        # Initialize vector store service
+        self.vector_store_service = VectorStoreService()
         
         # TODO: Initialize MongoDB connection when implemented
         # from database.mongodb import get_database
@@ -211,13 +211,9 @@ class IngestionService:
         Returns:
             True if successful, False otherwise
         """
-        # TODO: Implement storage logic
-        # 1. Store embeddings in FAISS vector store
-        #    - Create/load FAISS index for this repository
-        #    - Add embeddings to index
-        #    - Save index to {vector_store_path}/{repo_id}.faiss
-        #
-        # 2. Store metadata in MongoDB
+        # Storage logic:
+        # 1. Store embeddings in FAISS vector store (implemented)
+        # 2. Store metadata in MongoDB (TODO)
         #    - Insert documents into 'code_chunks' collection
         #    - Each document should contain:
         #      {
@@ -237,11 +233,17 @@ class IngestionService:
         #      }
         
         try:
-            # TODO: Store in FAISS
-            # vector_store_path = Path(settings.vector_store_path)
-            # vector_store_path.mkdir(exist_ok=True)
-            # index_path = vector_store_path / f"{repo_id}.faiss"
-            # self.vector_store_service.save_embeddings(embedded_chunks, index_path)
+            # Store embeddings in FAISS
+            logger.info("Storing embeddings in FAISS for repository: %s", repo_id)
+            faiss_success = self.vector_store_service.save_embeddings(
+                embedded_chunks=embedded_chunks,
+                repo_id=repo_id,
+                overwrite=False  # Append to existing index if it exists
+            )
+            
+            if not faiss_success:
+                logger.error("Failed to store embeddings in FAISS for repository: %s", repo_id)
+                return False
             
             # TODO: Store metadata in MongoDB
             # collection = self.db["code_chunks"]
