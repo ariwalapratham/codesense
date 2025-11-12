@@ -9,7 +9,7 @@ class Settings(BaseSettings):
 
     # Gemini Configuration
     gemini_api_key: Optional[str] = None
-    gemini_embedding_model: str = "models/embedding-001"
+    gemini_embedding_model: str = "gemini-embedding-001"
     gemini_llm_model: str = "gemini-pro"
 
     # MongoDB Configuration

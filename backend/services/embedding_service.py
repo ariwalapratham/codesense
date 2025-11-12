@@ -7,10 +7,12 @@ import numpy as np
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 try:
-    import google.generativeai as genai
+    from google import genai
+    from google.genai import types
     GEMINI_AVAILABLE = True
 except ImportError:
     genai = None
+    types = None
     GEMINI_AVAILABLE = False
 
 from config.settings import settings
@@ -26,15 +28,16 @@ class EmbeddingService:
         """Initialize embedding service with configuration."""
         # Initialize Gemini API if available
         if GEMINI_AVAILABLE and settings.gemini_api_key:
-            genai.configure(api_key=settings.gemini_api_key)
+            self.client = genai.Client(api_key=settings.gemini_api_key)
             self.embedding_model = settings.gemini_embedding_model
             self.gemini_available = True
             logger.info("Gemini embedding service initialized with model: %s", self.embedding_model)
         else:
+            self.client = None
             self.embedding_model = None
             self.gemini_available = False
             if not GEMINI_AVAILABLE:
-                logger.warning("google-generativeai not available. Embeddings will not be generated.")
+                logger.warning("google-genai not available. Embeddings will not be generated.")
             elif not settings.gemini_api_key:
                 logger.warning("Gemini API key not configured. Embeddings will not be generated.")
 
@@ -402,63 +405,55 @@ class EmbeddingService:
             batch_texts = [chunk["code_text"] for chunk in batch]
 
             try:
-                # Generate embeddings for batch
-                # Gemini embedding API can handle single text or list of texts
-                if len(batch_texts) == 1:
-                    # Single text
-                    result = genai.embed_content(
+                # Generate embeddings for batch using new SDK
+                # According to docs: https://ai.google.dev/gemini-api/docs/embeddings
+                # result.embeddings is always a list, even for single text
+                # Each embedding object has .values attribute
+                # Specify output_dimensionality=768 for consistent dimension (default is 3072)
+                if types is not None:
+                    result = self.client.models.embed_content(
                         model=self.embedding_model,
-                        content=batch_texts[0],
-                        task_type="retrieval_document"
+                        contents=batch_texts,
+                        config=types.EmbedContentConfig(output_dimensionality=768)
                     )
-                    embedding_list = [result.get("embedding", [])]
                 else:
-                    # Batch of texts
-                    result = genai.embed_content(
+                    # Fallback if types module not available (shouldn't happen if GEMINI_AVAILABLE)
+                    result = self.client.models.embed_content(
                         model=self.embedding_model,
-                        content=batch_texts,
-                        task_type="retrieval_document"
+                        contents=batch_texts
                     )
-                    # Handle batch response format
-                    # Gemini API returns different formats:
-                    # - Single text: {"embedding": [...]}
-                    # - Batch: {"embeddings": [{"embedding": [...]}, ...]} or list of dicts
+                
+                # Extract embeddings from response
+                # According to docs: result.embeddings is always a list of Embedding objects
+                # Each embedding object has .values attribute containing the embedding vector
+                embedding_list = []
+                
+                if not hasattr(result, 'embeddings'):
+                    logger.error("Response missing 'embeddings' attribute. Response type: %s, dir: %s", 
+                                type(result), dir(result))
                     embedding_list = []
-                    
-                    if isinstance(result, dict):
-                        if "embeddings" in result:
-                            # Batch response with 'embeddings' key
-                            embeddings_data = result["embeddings"]
-                            if isinstance(embeddings_data, list):
-                                embedding_list = [
-                                    emb.get("embedding", []) if isinstance(emb, dict) else emb
-                                    for emb in embeddings_data
-                                ]
-                            else:
-                                logger.warning("Unexpected 'embeddings' format in batch response")
-                                embedding_list = []
-                        elif "embedding" in result:
-                            # Single embedding in dict (shouldn't happen for batch, but handle it)
-                            embedding_list = [result["embedding"]]
+                elif not result.embeddings:
+                    logger.error("Response has 'embeddings' but it's empty")
+                    embedding_list = []
+                else:
+                    logger.debug("Received %d embeddings in response", len(result.embeddings))
+                    for idx, embedding_obj in enumerate(result.embeddings):
+                        # Each embedding object has .values attribute
+                        if hasattr(embedding_obj, 'values'):
+                            embedding_values = list(embedding_obj.values)
+                            embedding_list.append(embedding_values)
+                            logger.debug("Embedding %d: length=%d", idx, len(embedding_values))
                         else:
-                            logger.warning("No 'embedding' or 'embeddings' key in response dict")
-                            embedding_list = []
-                    elif isinstance(result, list):
-                        # Direct list of embeddings or dicts
-                        embedding_list = [
-                            emb.get("embedding", []) if isinstance(emb, dict) else emb
-                            for emb in result
-                        ]
-                    else:
-                        logger.warning("Unexpected response type: %s", type(result))
-                        embedding_list = []
-                    
-                    # Validate we got the expected number of embeddings
-                    if len(embedding_list) != len(batch_texts):
-                        logger.warning(
-                            "Mismatch in embedding count: expected %d, got %d",
-                            len(batch_texts), len(embedding_list)
-                        )
+                            logger.warning("Embedding object %d missing .values attribute: %s, dir: %s", 
+                                         idx, type(embedding_obj), dir(embedding_obj))
+                            embedding_list.append([])
+                
+                # Validate we got the expected number of embeddings
+                if len(embedding_list) != len(batch_texts):
+                    logger.warning(
+                        "Mismatch in embedding count: expected %d, got %d",
+                        len(batch_texts), len(embedding_list)
+                    )
 
                 # Attach embeddings to chunks with validation
                 for idx, chunk in enumerate(batch):
@@ -488,11 +483,17 @@ class EmbeddingService:
                             embedded_chunks.append(chunk)
                             continue
                         
-                        # Check embedding dimension
-                        if len(embedding_array) != 768:
+                        # Check embedding dimension (should be 768 if output_dimensionality=768 was specified)
+                        # Accept 768 (requested) or 3072 (default) as valid dimensions
+                        if len(embedding_array) not in (768, 3072):
                             logger.warning(
-                                "Unexpected embedding dimension %d (expected 768) for chunk %s",
+                                "Unexpected embedding dimension %d (expected 768 or 3072) for chunk %s",
                                 len(embedding_array), chunk.get("chunk_id")
+                            )
+                        elif len(embedding_array) == 3072:
+                            logger.debug(
+                                "Received 3072-dim embedding for chunk %s (requested 768, using default)",
+                                chunk.get("chunk_id")
                             )
                         
                         chunk["embedding"] = embedding

@@ -29,12 +29,14 @@ class VectorStoreService:
         # Cache for chunk_id mappings (repo_id -> {chunk_id: index_position})
         self._chunk_mappings: Dict[str, Dict[str, int]] = {}
         
-        # Embedding dimension (Gemini embedding-001 produces 768-dimensional vectors)
-        # This will be determined from the first embedding
+        # Embedding dimension (will be determined from the first embedding)
+        # gemini-embedding-001 supports: 128-3072 dimensions
+        # Default is 3072, but we request 768 for efficiency
         self.embedding_dim: Optional[int] = None
         
-        # Expected embedding dimension for Gemini embedding-001
-        self.expected_embedding_dim = 768
+        # Expected embedding dimensions for gemini-embedding-001
+        # Accept both 768 (requested) and 3072 (default) as valid
+        self.expected_embedding_dims = (768, 3072)
         
         logger.info("Vector store service initialized at: %s", self.vector_store_path)
 
@@ -247,11 +249,11 @@ class VectorStoreService:
         embedding_dim = len(first_embedding)
         
         # Validate embedding dimension
-        if embedding_dim != self.expected_embedding_dim:
+        if embedding_dim not in self.expected_embedding_dims:
             logger.warning(
-                "Unexpected embedding dimension: %d (expected %d for Gemini embedding-001). "
+                "Unexpected embedding dimension: %d (expected %s for gemini-embedding-001). "
                 "This may indicate a different model or API change.",
-                embedding_dim, self.expected_embedding_dim
+                embedding_dim, " or ".join(map(str, self.expected_embedding_dims))
             )
         
         if self.embedding_dim is None:
