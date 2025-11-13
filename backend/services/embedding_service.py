@@ -1,5 +1,6 @@
 """Embedding service for chunking code and generating embeddings using Gemini."""
 
+import asyncio
 import logging
 from typing import Dict, List, Optional
 
@@ -379,7 +380,7 @@ class EmbeddingService:
         logger.info("Created %d code chunks using hybrid strategy", len(chunks))
         return chunks
 
-    def generate_embeddings(self, chunks: List[Dict], batch_size: int = 10) -> List[Dict]:
+    async def generate_embeddings(self, chunks: List[Dict], batch_size: int = 10) -> List[Dict]:
         """
         Generate embeddings for code chunks using Gemini.
 
@@ -405,22 +406,41 @@ class EmbeddingService:
             batch_texts = [chunk["code_text"] for chunk in batch]
 
             try:
-                # Generate embeddings for batch using new SDK
+                # Generate embeddings for batch using new SDK (run in executor as API call may block)
                 # According to docs: https://ai.google.dev/gemini-api/docs/embeddings
                 # result.embeddings is always a list, even for single text
                 # Each embedding object has .values attribute
                 # Specify output_dimensionality=768 for consistent dimension (default is 3072)
+                loop = asyncio.get_event_loop()
+                
+                # Create a closure-safe function for executor
+                def generate_embeddings_sync(texts, use_config=True):
+                    if use_config and types is not None:
+                        return self.client.models.embed_content(
+                            model=self.embedding_model,
+                            contents=texts,
+                            config=types.EmbedContentConfig(output_dimensionality=768)
+                        )
+                    else:
+                        return self.client.models.embed_content(
+                            model=self.embedding_model,
+                            contents=texts
+                        )
+                
                 if types is not None:
-                    result = self.client.models.embed_content(
-                        model=self.embedding_model,
-                        contents=batch_texts,
-                        config=types.EmbedContentConfig(output_dimensionality=768)
+                    result = await loop.run_in_executor(
+                        None,
+                        generate_embeddings_sync,
+                        batch_texts,
+                        True
                     )
                 else:
                     # Fallback if types module not available (shouldn't happen if GEMINI_AVAILABLE)
-                    result = self.client.models.embed_content(
-                        model=self.embedding_model,
-                        contents=batch_texts
+                    result = await loop.run_in_executor(
+                        None,
+                        generate_embeddings_sync,
+                        batch_texts,
+                        False
                     )
                 
                 # Extract embeddings from response
@@ -530,7 +550,7 @@ class EmbeddingService:
 
         return embedded_chunks
 
-    def chunk_and_embed(self, parsed_structures: List[Dict], batch_size: int = 10) -> List[Dict]:
+    async def chunk_and_embed(self, parsed_structures: List[Dict], batch_size: int = 10) -> List[Dict]:
         """
         Convenience method to chunk code and generate embeddings in one call.
 
@@ -541,10 +561,14 @@ class EmbeddingService:
         Returns:
             List of chunks with embeddings added
         """
-        # Step 1: Chunk code
-        chunks = self.chunk_code(parsed_structures)
+        # Step 1: Chunk code (run in executor as it's CPU-bound)
+        loop = asyncio.get_event_loop()
+        chunks = await loop.run_in_executor(
+            None,
+            lambda: self.chunk_code(parsed_structures)
+        )
 
         # Step 2: Generate embeddings
-        embedded_chunks = self.generate_embeddings(chunks, batch_size=batch_size)
+        embedded_chunks = await self.generate_embeddings(chunks, batch_size=batch_size)
 
         return embedded_chunks

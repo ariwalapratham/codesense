@@ -1,5 +1,6 @@
 """Vector store service for managing FAISS indices and embeddings."""
 
+import asyncio
 import logging
 import pickle
 from pathlib import Path
@@ -209,12 +210,12 @@ class VectorStoreService:
         self._index_cache[repo_id] = index
         return index, True
 
-    def save_embeddings(
+    async def save_embeddings(
         self,
         embedded_chunks: List[Dict],
         repo_id: str,
         overwrite: bool = False
-    ) -> bool:
+    ) -> Tuple[bool, Dict[str, int]]:
         """
         Save embeddings to FAISS index for a repository.
 
@@ -224,11 +225,11 @@ class VectorStoreService:
             overwrite: Whether to overwrite existing index (default: False, append)
 
         Returns:
-            True if successful, False otherwise
+            Tuple of (success: bool, chunk_mapping: Dict[str, int])
         """
         if not embedded_chunks:
             logger.warning("No embedded chunks provided for repository: %s", repo_id)
-            return False
+            return False, {}
 
         # Filter chunks with valid embeddings
         valid_chunks = [
@@ -238,13 +239,13 @@ class VectorStoreService:
 
         if not valid_chunks:
             logger.warning("No chunks with valid embeddings for repository: %s", repo_id)
-            return False
+            return False, {}
 
         # Determine embedding dimension from first chunk
         first_embedding = valid_chunks[0]["embedding"]
         if not isinstance(first_embedding, (list, np.ndarray)):
             logger.error("Invalid embedding format for repository: %s", repo_id)
-            return False
+            return False, {}
 
         embedding_dim = len(first_embedding)
         
@@ -263,22 +264,10 @@ class VectorStoreService:
                 "Embedding dimension mismatch: expected %d, got %d",
                 self.embedding_dim, embedding_dim
             )
-            return False
+            return False, {}
 
         try:
-            # Get or create index
-            index, is_new = self._get_or_create_index(repo_id, embedding_dim)
-            
-            # Load existing chunk mapping
-            if overwrite or is_new:
-                chunk_mapping = {}
-                if not is_new and overwrite:
-                    # Clear existing index
-                    index.reset()
-            else:
-                chunk_mapping = self._load_chunk_mapping(repo_id)
-
-            # Prepare embeddings as numpy array
+            # Prepare embeddings as numpy array (lightweight, can do in main thread)
             embeddings = []
             chunk_ids = []
             
@@ -317,10 +306,52 @@ class VectorStoreService:
 
             if not embeddings:
                 logger.error("No valid embeddings to save for repository: %s", repo_id)
-                return False
+                return False, {}
 
             # Stack embeddings into single array
             embeddings_array = np.vstack(embeddings)
+
+            # Run FAISS operations in executor (CPU-bound)
+            loop = asyncio.get_event_loop()
+            success, chunk_mapping = await loop.run_in_executor(
+                None,
+                lambda: self._save_embeddings_sync(
+                    repo_id, embedding_dim, embeddings_array, chunk_ids, overwrite
+                )
+            )
+
+            if success:
+                logger.info(
+                    "Saved %d embeddings to FAISS index for repository: %s",
+                    len(embeddings_array), repo_id
+                )
+            return success, chunk_mapping
+
+        except Exception as e:
+            logger.error("Failed to save embeddings for repository %s: %s", repo_id, e, exc_info=True)
+            return False, {}
+    
+    def _save_embeddings_sync(
+        self,
+        repo_id: str,
+        embedding_dim: int,
+        embeddings_array: np.ndarray,
+        chunk_ids: List[str],
+        overwrite: bool
+    ) -> Tuple[bool, Dict[str, int]]:
+        """Synchronous helper for FAISS operations."""
+        try:
+            # Get or create index
+            index, is_new = self._get_or_create_index(repo_id, embedding_dim)
+            
+            # Load existing chunk mapping
+            if overwrite or is_new:
+                chunk_mapping = {}
+                if not is_new and overwrite:
+                    # Clear existing index
+                    index.reset()
+            else:
+                chunk_mapping = self._load_chunk_mapping(repo_id)
 
             # Train index if using IVFFlat and it's new
             if isinstance(index, faiss.IndexIVFFlat) and is_new:
@@ -351,20 +382,16 @@ class VectorStoreService:
             
             if not (index_saved and mapping_saved):
                 logger.error("Failed to save index or mapping for repository: %s", repo_id)
-                return False
+                return False, {}
 
             # Update cache
             self._chunk_mappings[repo_id] = chunk_mapping
 
-            logger.info(
-                "Saved %d embeddings to FAISS index for repository: %s (total: %d)",
-                len(embeddings_array), repo_id, index.ntotal
-            )
-            return True
+            return True, chunk_mapping
 
         except Exception as e:
-            logger.error("Failed to save embeddings for repository %s: %s", repo_id, e, exc_info=True)
-            return False
+            logger.error("Failed to save embeddings synchronously: %s", e, exc_info=True)
+            return False, {}
 
     def search_similar(
         self,

@@ -7,6 +7,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.routes import ingestion, repository
+from database.mongodb import mongodb
 
 # Setup logging
 logging.basicConfig(
@@ -28,11 +29,13 @@ async def lifespan(_app: FastAPI):
     """
     # Startup
     logger.info("Starting application...")
-    
+
     yield
-    
+
     # Shutdown
     logger.info("Shutting down application...")
+    await mongodb.close()
+    logger.info("MongoDB connection closed")
 
 
 # Create FastAPI application

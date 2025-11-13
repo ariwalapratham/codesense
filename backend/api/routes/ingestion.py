@@ -74,7 +74,7 @@ async def ingest_repository(request: IngestionRequest) -> IngestionResponse:
         repo_url = str(request.repo_url)
         
         # Call ingestion service
-        success, message, metadata = service.ingest_repository(
+        success, message, metadata = await service.ingest_repository(
             repo_url=repo_url,
             branch=request.branch,
             cleanup=request.cleanup
