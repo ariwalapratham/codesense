@@ -4,6 +4,7 @@ import logging
 from datetime import datetime
 from typing import Dict, List
 
+from pymongo import UpdateOne
 from pymongo.errors import BulkWriteError
 
 from database.mongodb import mongodb
@@ -83,26 +84,19 @@ class MongoDBService:
             return True
 
         try:
-            # Validate and prepare chunks
-            operations = []
+            operations: List[UpdateOne] = []
             for chunk_data in chunks_data:
                 try:
-                    # Validate with schema
                     chunk_schema = ChunkSchema(**chunk_data)
                     chunk_dict = chunk_schema.model_dump()
 
-                    # Prepare upsert operation
-                    operation = {
-                        "updateOne": {
-                            "filter": {"chunk_id": chunk_dict["chunk_id"]},
-                            "update": {
-                                "$set": chunk_dict
-                            },
-                            "upsert": True
-                        }
-                    }
-                    operations.append(operation)
-
+                    operations.append(
+                        UpdateOne(
+                            {"chunk_id": chunk_dict["chunk_id"]},
+                            {"$set": chunk_dict},
+                            upsert=True
+                        )
+                    )
                 except Exception as e:
                     logger.warning(
                         "Failed to validate chunk %s: %s",

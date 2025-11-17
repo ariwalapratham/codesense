@@ -28,7 +28,6 @@ class IngestionResponse(BaseModel):
 
     success: bool = Field(..., description="Whether ingestion was successful")
     message: str = Field(..., description="Status message")
-    metadata: Optional[dict] = Field(None, description="Ingestion metadata")
 
     class Config:
         """Pydantic config."""
@@ -36,13 +35,6 @@ class IngestionResponse(BaseModel):
         json_schema_extra = {
             "example": {
                 "success": True,
-                "message": "Successfully ingested repository owner_repo. Processed 50 files and created 200 chunks.",
-                "metadata": {
-                    "repo_id": "owner_repo",
-                    "status": "completed",
-                    "files_processed": 50,
-                    "chunks_processed": 200,
-                    "commit_hash": "abc1234"
-                }
+                "message": "Successfully ingested repository owner_repo. Processed 50 files and created 200 chunks."
             }
         }

@@ -10,9 +10,13 @@ from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import aiofiles
+from git import Repo
+from git.exc import InvalidGitRepositoryError
 
 from config.settings import settings
+from schemas import ChunkMetadata, ParsingStats
 from services.embedding_service import EmbeddingService
+from services.mongodb_service import MongoDBService
 from services.parser_service import ParserService
 from services.repository_service import RepositoryService
 from services.vector_store_service import VectorStoreService
@@ -29,18 +33,17 @@ class IngestionService:
         # Get temp_repos_path from settings
         self.temp_repos_path = Path(settings.temp_repos_path)
         self.temp_repos_path.mkdir(exist_ok=True, parents=True)
-        
+
         # Initialize parser service
         self.parser_service = ParserService()
-        
+
         # Initialize embedding service (handles chunking and embedding)
         self.embedding_service = EmbeddingService()
-        
+
         # Initialize vector store service
         self.vector_store_service = VectorStoreService()
-        
+
         # Initialize MongoDB service
-        from services.mongodb_service import MongoDBService
         self.mongodb_service = MongoDBService()
 
     @staticmethod
@@ -56,17 +59,17 @@ class IngestionService:
         """
         parsed = urlparse(repo_url)
         path_parts = parsed.path.strip("/").split("/")
-        
+
         if len(path_parts) >= 2:
             owner = path_parts[0]
             repo_name = path_parts[1].replace(".git", "")
         else:
             raise ValueError(f"Invalid repository URL format: {repo_url}")
-        
+
         # Create sanitized repo_id: owner_repo
         repo_id = f"{owner}_{repo_name}".lower()
         repo_id = re.sub(r"[^a-z0-9_]", "_", repo_id)
-        
+
         return owner, repo_name, repo_id
 
     def _prepare_temp_repo_path(self, repo_name: str, commit_hash: Optional[str] = None) -> Path:
@@ -105,18 +108,17 @@ class IngestionService:
                 lambda: self._get_commit_hash_sync(repo_path)
             )
             return commit_hash
-        except Exception as e:
+        except (InvalidGitRepositoryError, OSError, ValueError) as e:
             logger.warning("Failed to get commit hash: %s", e)
             return None
-    
+
     @staticmethod
     def _get_commit_hash_sync(repo_path: Path) -> Optional[str]:
         """Synchronous helper to get commit hash."""
         try:
-            from git import Repo
             repo = Repo(repo_path)
             return repo.head.commit.hexsha[:7]
-        except Exception as e:
+        except (InvalidGitRepositoryError, OSError, ValueError) as e:
             logger.warning("Failed to get commit hash: %s", e)
             return None
 
@@ -130,23 +132,15 @@ class IngestionService:
         Returns:
             List of file paths to process
         """
-        # TODO: Implement file discovery logic
-        # - Walk through repository directory
-        # - Filter by file extensions (.py, .js, .ts, .java, .go, etc.)
-        # - Skip directories: .git, node_modules, __pycache__, venv, etc.
-        # - Respect .gitignore if present
-        # - Return list of Path objects
-        
-        code_files = []
         supported_extensions = {
-            ".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".go", 
-            ".cpp", ".c", ".h", ".hpp", ".cs", ".rb", ".php", 
+            ".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".go",
+            ".cpp", ".c", ".h", ".hpp", ".cs", ".rb", ".php",
             ".swift", ".kt", ".rs", ".scala", ".r", ".m", ".ipynb"
         }
-        
-        skip_dirs = {".git", "node_modules", "__pycache__", "venv", 
+
+        skip_dirs = {".git", "node_modules", "__pycache__", "venv",
                      ".venv", "env", ".env", "dist", "build", ".pytest_cache"}
-        
+
         try:
             # Run file discovery in executor to avoid blocking
             loop = asyncio.get_event_loop()
@@ -160,11 +154,11 @@ class IngestionService:
                     and file_path.suffix.lower() in supported_extensions
                 ]
             )
-            
+
             logger.info("Discovered %d code files in repository", len(code_files))
             return code_files
-            
-        except Exception as e:
+
+        except OSError as e:
             logger.error("Error discovering code files: %s", e)
             return []
 
@@ -179,37 +173,24 @@ class IngestionService:
         Returns:
             List of parsed code structures with metadata
         """
-        # TODO: Implement parsing logic using parser_service
-        # - Use tree-sitter to parse each file
-        # - Extract functions, classes, methods, imports
-        # - Return list of dictionaries with:
-        #   {
-        #       "file_path": str (relative to repo),
-        #       "language": str,
-        #       "functions": [...],
-        #       "classes": [...],
-        #       "imports": [...],
-        #       "code_text": str (full file content)
-        #   }
-        
         parsed_structures = []
         loop = asyncio.get_event_loop()
-        
+
         # Process files concurrently
         async def parse_single_file(file_path: Path) -> Optional[Dict]:
             try:
                 relative_path = file_path.relative_to(repo_path)
-                
+
                 # Read file content asynchronously
                 async with aiofiles.open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                     code_text = await f.read()
-                
+
                 # Run parser in executor (CPU-bound operation)
                 parsed = await loop.run_in_executor(
                     None,
                     lambda: self.parser_service.parse_file(file_path, code_text, language=None)
                 )
-                
+
                 return {
                     "file_path": str(relative_path),
                     "language": parsed.get("language", "unknown"),
@@ -218,27 +199,27 @@ class IngestionService:
                     "classes": parsed.get("classes", []),
                     "imports": parsed.get("imports", []),
                 }
-                
-            except Exception as e:
+
+            except (OSError, ValueError, UnicodeDecodeError) as e:
                 logger.warning("Failed to parse file %s: %s", file_path, e)
                 return None
-        
+
         # Parse files concurrently (limit concurrency to avoid overwhelming system)
         semaphore = asyncio.Semaphore(10)  # Process up to 10 files concurrently
-        
+
         async def parse_with_semaphore(file_path: Path):
             async with semaphore:
                 return await parse_single_file(file_path)
-        
+
         tasks = [parse_with_semaphore(file_path) for file_path in files]
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        
+
         for result in results:
             if isinstance(result, dict):
                 parsed_structures.append(result)
             elif isinstance(result, Exception):
                 logger.warning("Exception parsing file: %s", result)
-        
+
         logger.info("Parsed %d files", len(parsed_structures))
         return parsed_structures
 
@@ -274,8 +255,6 @@ class IngestionService:
         Returns:
             Repository data dictionary
         """
-        from schemas import ParsingStats
-
         repo_data = {
             "repo_id": repo_id,
             "owner": owner,
@@ -313,8 +292,6 @@ class IngestionService:
         Returns:
             List of chunk data dictionaries
         """
-        from schemas import ChunkMetadata
-
         chunks_data = []
         for chunk in embedded_chunks:
             chunk_id = chunk["chunk_id"]
@@ -431,7 +408,8 @@ class IngestionService:
             await self.mongodb_service.delete_chunks_by_repo(repo_id)
 
             # Upsert chunks
-            logger.info("Upserting %d chunks in MongoDB for repository: %s", len(chunks_data), repo_id)
+            logger.info("Upserting %d chunks in MongoDB for repository: %s",
+                len(chunks_data), repo_id)
             chunks_success = await self.mongodb_service.upsert_chunks(chunks_data)
             if not chunks_success:
                 logger.warning("Failed to upsert some chunks in MongoDB, continuing...")
@@ -439,7 +417,7 @@ class IngestionService:
             logger.info("Stored %d chunks for repository %s", len(embedded_chunks), repo_id)
             return True
 
-        except Exception as e:
+        except (OSError, ValueError, KeyError) as e:
             logger.error("Failed to store embeddings: %s", e, exc_info=True)
             return False
 
@@ -460,7 +438,7 @@ class IngestionService:
                 logger.info("Cleaned up temporary repository: %s", repo_path)
                 return True
             return True
-        except Exception as e:
+        except OSError as e:
             logger.error("Failed to cleanup temporary repository %s: %s", repo_path, e)
             return False
 
@@ -469,7 +447,7 @@ class IngestionService:
         repo_url: str,
         branch: Optional[str] = None,
         cleanup: bool = True
-    ) -> Tuple[bool, str, Optional[Dict]]:
+    ) -> Tuple[bool, str]:
         """
         Orchestrate the complete ingestion pipeline for a repository.
 
@@ -481,32 +459,28 @@ class IngestionService:
             cleanup: Whether to cleanup temporary repository after processing
 
         Returns:
-            Tuple of (success: bool, message: str, metadata: Optional[Dict])
+            Tuple of (success: bool, message: str)
         """
         repo_path = None
-        metadata = {
-            "repo_url": repo_url,
-            "status": "failed",
-            "chunks_processed": 0,
-            "files_processed": 0
-        }
-        
+        parsing_stats: Optional[Dict] = None
+
         try:
             logger.info("Starting ingestion pipeline for repository: %s", repo_url)
-            
+
             # Step 1: Extract repository information
             try:
                 owner, repo_name, repo_id = self._extract_repo_info(repo_url)
-                logger.info("Repository info - Owner: %s, Name: %s, ID: %s", owner, repo_name, repo_id)
-            except Exception as e:
+                logger.info("Repository info - Owner: %s, Name: %s, ID: %s",
+                    owner, repo_name, repo_id)
+            except ValueError as e:
                 error_msg = f"Failed to extract repository information: {e}"
                 logger.error("%s", error_msg)
-                return False, error_msg, None
-            
+                return False, error_msg
+
             # Step 2: Prepare temporary repository path (initially without commit hash)
             repo_path = self._prepare_temp_repo_path(repo_name)
             logger.info("Temporary repository path: %s", repo_path)
-            
+
             # Step 3: Clone repository (run in executor as it's blocking)
             logger.info("Cloning repository...")
             loop = asyncio.get_event_loop()
@@ -518,26 +492,25 @@ class IngestionService:
                     branch=branch
                 )
             )
-            
+
             if not success:
                 error_msg = f"Failed to clone repository: {message}"
                 logger.error("%s", error_msg)
-                return False, error_msg, None
-            
+                return False, error_msg
+
             logger.info("Repository cloned successfully: %s", message)
-            
+
             # Step 4: Get commit hash and update repo path if needed
             commit_hash = await self._get_commit_hash(repo_path)
             if commit_hash:
                 logger.info("Repository commit hash: %s", commit_hash)
-                metadata["commit_hash"] = commit_hash
-                
+
                 # Rename temp repo path to use commit hash
                 new_repo_path = self._prepare_temp_repo_path(repo_name, commit_hash)
                 if repo_path != new_repo_path and new_repo_path.exists():
                     # If path with commit hash already exists, use it
                     if cleanup:
-                        self._cleanup_temp_repo(repo_path)
+                        await self._cleanup_temp_repo(repo_path)
                     repo_path = new_repo_path
                 elif repo_path != new_repo_path:
                     # Rename to new path with commit hash
@@ -545,80 +518,77 @@ class IngestionService:
                         repo_path.rename(new_repo_path)
                         repo_path = new_repo_path
                         logger.info("Renamed temp repo path to: %s", repo_path)
-                    except Exception as e:
+                    except OSError as e:
                         logger.warning("Failed to rename temp repo path: %s", e)
-            
+
             # Step 5: Discover code files
             logger.info("Discovering code files...")
             code_files = await self._discover_code_files(repo_path)
-            
+
             if not code_files:
                 error_msg = "No code files found in repository"
                 logger.warning("%s", error_msg)
                 if cleanup:
                     await self._cleanup_temp_repo(repo_path)
-                return False, error_msg, None
-            
-            metadata["files_processed"] = len(code_files)
+                return False, error_msg
+
             logger.info("Found %d code files to process", len(code_files))
-            
+
             # Step 6: Parse files
             logger.info("Parsing code files...")
             parsed_structures = await self._parse_files(code_files, repo_path)
-            
+
             if not parsed_structures:
                 error_msg = "Failed to parse any files"
                 logger.error(error_msg)
                 if cleanup:
                     await self._cleanup_temp_repo(repo_path)
-                return False, error_msg, None
-            
+                return False, error_msg
+
             # Calculate parsing statistics
             total_functions = sum(len(s.get("functions", [])) for s in parsed_structures)
             total_classes = sum(len(s.get("classes", [])) for s in parsed_structures)
             total_imports = sum(len(s.get("imports", [])) for s in parsed_structures)
             languages_found = list(set(s.get("language", "unknown") for s in parsed_structures))
-            
-            metadata["parsing_stats"] = {
+
+            parsing_stats = {
                 "files_parsed": len(parsed_structures),
                 "total_functions": total_functions,
                 "total_classes": total_classes,
                 "total_imports": total_imports,
                 "languages": languages_found
             }
-            
+
             logger.info(
                 "Parsing complete: %d files, %d functions, %d classes, %d imports",
                 len(parsed_structures), total_functions, total_classes, total_imports
             )
-            
+
             # Step 7: Chunk code and generate embeddings
             logger.info("Chunking code and generating embeddings...")
             embedded_chunks = await self.embedding_service.chunk_and_embed(
                 parsed_structures,
                 batch_size=10  # Process 10 chunks at a time for embeddings
             )
-            
+
             if not embedded_chunks:
                 error_msg = "Failed to chunk code and generate embeddings"
                 logger.error(error_msg)
                 if cleanup:
                     await self._cleanup_temp_repo(repo_path)
-                return False, error_msg, None
-            
+                return False, error_msg
+
             # Count chunks with successful embeddings
             chunks_with_embeddings = sum(
                 1 for chunk in embedded_chunks
                 if chunk.get("embedding") is not None
             )
-            metadata["chunks_processed"] = len(embedded_chunks)
-            metadata["chunks_with_embeddings"] = chunks_with_embeddings
-            
+
             logger.info(
                 "Created %d chunks, %d with embeddings",
                 len(embedded_chunks), chunks_with_embeddings
             )
-            
+
             # Step 9: Store embeddings and metadata
             logger.info("Storing embeddings and metadata...")
             store_success = await self._store_embeddings(
@@ -631,44 +601,37 @@ class IngestionService:
                 commit_hash=commit_hash,
                 files_processed=len(code_files),
                 chunks_with_embeddings=chunks_with_embeddings,
-                parsing_stats=metadata.get("parsing_stats")
+                parsing_stats=parsing_stats
             )
-            
+
             if not store_success:
                 error_msg = "Failed to store embeddings"
                 logger.error(error_msg)
                 if cleanup:
                     await self._cleanup_temp_repo(repo_path)
-                return False, error_msg, None
-            
+                return False, error_msg
+
             # Step 10: Cleanup temporary repository
             if cleanup:
                 logger.info("Cleaning up temporary repository...")
-                self._cleanup_temp_repo(repo_path)
-            
-            # Success
-            metadata.update({
-                "status": "completed",
-                "repo_id": repo_id,
-                "owner": owner,
-                "repo_name": repo_name,
-                "repo_path": str(repo_path) if repo_path else None
-            })
-            
+                await self._cleanup_temp_repo(repo_path)
+
             success_msg = (
                 f"Successfully ingested repository {repo_id}. "
                 f"Processed {len(code_files)} files and created {len(embedded_chunks)} chunks."
             )
             logger.info(success_msg)
-            
-            return True, success_msg, metadata
-            
-        except Exception as e:
+
+            return True, success_msg
+
+        # Top-level orchestration method needs broad exception handling
+        # to ensure cleanup and proper error reporting
+        except (OSError, ValueError, KeyError, RuntimeError, AttributeError) as e:
             error_msg = f"Unexpected error during ingestion: {e}"
             logger.error(error_msg, exc_info=True)
-            
+
             # Cleanup on error
             if cleanup and repo_path:
-                self._cleanup_temp_repo(repo_path)
-            
-            return False, error_msg, metadata
+                await self._cleanup_temp_repo(repo_path)
+
+            return False, error_msg
