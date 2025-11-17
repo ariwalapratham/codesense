@@ -1,40 +1,21 @@
 """Ingestion API routes for repository processing."""
 
 import logging
-from typing import Dict, Optional
+from typing import Dict
 
 from fastapi import APIRouter, HTTPException, status
 
 from models.schemas import IngestionRequest, IngestionResponse
 from services.ingestion_service import IngestionService
 
-# Setup logger
 logger = logging.getLogger(__name__)
 
-# Create router
 router = APIRouter(
     prefix="/ingestion",
-    tags=["ingestion"]
+    tags=["ingestion"],
 )
 
-# Lazy-loaded ingestion service instance
-_ingestion_service: Optional[IngestionService] = None
-
-
-def get_ingestion_service() -> IngestionService:
-    """
-    Get or create the ingestion service instance (lazy initialization).
-
-    Returns:
-        IngestionService instance
-    """
-    global _ingestion_service
-    
-    if _ingestion_service is None:
-        _ingestion_service = IngestionService()
-        logger.info("Ingestion service initialized")
-    
-    return _ingestion_service
+ingestion_service = IngestionService()
 
 
 @router.post(
@@ -67,33 +48,31 @@ async def ingest_repository(request: IngestionRequest) -> IngestionResponse:
     """
     try:
         logger.info("Received ingestion request for repository: %s", request.repo_url)
-        
-        service = get_ingestion_service()
-        
+
         # Convert HttpUrl to string
         repo_url = str(request.repo_url)
-        
+
         # Call ingestion service
-        success, message = await service.ingest_repository(
+        success, message = await ingestion_service.ingest_repository(
             repo_url=repo_url,
             branch=request.branch,
             cleanup=request.cleanup
         )
-        
+
         if not success:
             logger.warning("Ingestion failed: %s", message)
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=message
             )
-        
+
         logger.info("Ingestion completed successfully for repository: %s", repo_url)
-        
+
         return IngestionResponse(
             success=success,
             message=message
         )
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -117,7 +96,6 @@ async def health_check() -> Dict[str, str]:
         Health status
     """
     try:
-        service = get_ingestion_service()
         return {
             "status": "healthy",
             "service": "ingestion",

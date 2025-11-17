@@ -2,10 +2,10 @@
 
 import logging
 from datetime import datetime
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 
 from pymongo import UpdateOne
-from pymongo.errors import BulkWriteError
+from pymongo.errors import BulkWriteError, PyMongoError
 
 from database.mongodb import mongodb
 from schemas import ChunkSchema, RepositorySchema
@@ -160,4 +160,213 @@ class MongoDBService:
                 e
             )
             return False
+
+    async def get_repository(self, repo_id: str) -> Optional[Dict]:
+        """
+        Get a single repository by ID.
+
+        Args:
+            repo_id: Repository identifier
+
+        Returns:
+            Repository data dictionary or None if not found
+        """
+        try:
+            repo_doc = await self.repositories.find_one({"repo_id": repo_id})
+            
+            if not repo_doc:
+                logger.debug("Repository not found: %s", repo_id)
+                return None
+            
+            # Remove MongoDB _id field
+            repo_doc.pop("_id", None)
+            
+            # Validate with schema
+            try:
+                repo_schema = RepositorySchema(**repo_doc)
+                return repo_schema.model_dump()
+            except Exception as e:
+                logger.warning(
+                    "Repository document validation failed for %s: %s",
+                    repo_id,
+                    e
+                )
+                # Return raw document if validation fails
+                return repo_doc
+
+        except PyMongoError as e:
+            logger.error(
+                "MongoDB error fetching repository %s: %s",
+                repo_id,
+                e,
+                exc_info=True
+            )
+            return None
+        except Exception as e:
+            logger.error(
+                "Unexpected error fetching repository %s: %s",
+                repo_id,
+                e,
+                exc_info=True
+            )
+            return None
+
+    async def list_repositories(
+        self,
+        skip: int = 0,
+        limit: int = 10,
+        search: Optional[str] = None
+    ) -> Tuple[List[Dict], int]:
+        """
+        List repositories with pagination and optional search.
+
+        Args:
+            skip: Number of repositories to skip
+            limit: Maximum number of repositories to return
+            search: Optional search query to filter by repo_name, owner, or repository_url
+
+        Returns:
+            Tuple of (list of repository dictionaries, total count)
+        """
+        try:
+            # Build search filter
+            search_filter = {}
+            if search:
+                # Case-insensitive regex search across repo_name, owner, and repository_url
+                search_regex = {"$regex": search, "$options": "i"}
+                search_filter = {
+                    "$or": [
+                        {"repo_name": search_regex},
+                        {"owner": search_regex},
+                        {"repository_url": search_regex}
+                    ]
+                }
+            
+            # Get total count with search filter
+            total = await self.repositories.count_documents(search_filter)
+            
+            # Fetch repositories with pagination and search, sorted by updated_at descending
+            cursor = (
+                self.repositories.find(search_filter)
+                .sort("updated_at", -1)
+                .skip(skip)
+                .limit(limit)
+            )
+            repo_docs = await cursor.to_list(length=limit)
+            
+            # Process and validate repositories
+            repositories = []
+            for repo_doc in repo_docs:
+                # Remove MongoDB _id field
+                repo_doc.pop("_id", None)
+                
+                # Validate with schema
+                try:
+                    repo_schema = RepositorySchema(**repo_doc)
+                    repositories.append(repo_schema.model_dump())
+                except Exception as e:
+                    logger.warning(
+                        "Repository document validation failed: %s",
+                        e
+                    )
+                    # Include raw document if validation fails
+                    repositories.append(repo_doc)
+            
+            logger.debug(
+                "Listed %d repositories (skip: %d, limit: %d, total: %d, search: %s)",
+                len(repositories),
+                skip,
+                limit,
+                total,
+                search or "none"
+            )
+            
+            return repositories, total
+
+        except PyMongoError as e:
+            logger.error(
+                "MongoDB error listing repositories: %s",
+                e,
+                exc_info=True
+            )
+            return [], 0
+        except Exception as e:
+            logger.error(
+                "Unexpected error listing repositories: %s",
+                e,
+                exc_info=True
+            )
+            return [], 0
+
+    async def get_repository_stats(self, repo_id: str) -> Optional[Dict]:
+        """
+        Get repository statistics using aggregation pipeline.
+
+        Args:
+            repo_id: Repository identifier
+
+        Returns:
+            Statistics dictionary or None if repository not found
+        """
+        try:
+            # First, verify repository exists and get basic info
+            repo = await self.get_repository(repo_id)
+            if not repo:
+                logger.debug("Repository not found for stats: %s", repo_id)
+                return None
+            
+            # Get total chunks count
+            total_chunks = await self.chunks.count_documents({"repo_id": repo_id})
+            
+            # Get language distribution using find and manual counting
+            # (more reliable than aggregate for async PyMongo)
+            language_distribution = {}
+            async for chunk in self.chunks.find({"repo_id": repo_id}, {"language": 1}):
+                language = chunk.get("language", "unknown")
+                language_distribution[language] = language_distribution.get(language, 0) + 1
+            
+            # Get chunk type distribution from metadata.type
+            chunk_type_distribution = {}
+            async for chunk in self.chunks.find({"repo_id": repo_id}, {"metadata.type": 1}):
+                chunk_type = chunk.get("metadata", {}).get("type", "unknown")
+                chunk_type_distribution[chunk_type] = chunk_type_distribution.get(chunk_type, 0) + 1
+            
+            # Get unique file count using distinct
+            unique_files = await self.chunks.distinct("file_path", {"repo_id": repo_id})
+            total_files = len(unique_files)
+            
+            stats = {
+                "repo_id": repo_id,
+                "repo_name": repo.get("repo_name", ""),
+                "total_chunks": total_chunks,
+                "total_files": total_files,
+                "language_distribution": language_distribution,
+                "chunk_type_distribution": chunk_type_distribution
+            }
+            
+            logger.debug(
+                "Retrieved stats for repository %s: %d chunks, %d files",
+                repo_id,
+                total_chunks,
+                total_files
+            )
+            
+            return stats
+
+        except PyMongoError as e:
+            logger.error(
+                "MongoDB error fetching repository stats for %s: %s",
+                repo_id,
+                e,
+                exc_info=True
+            )
+            return None
+        except Exception as e:
+            logger.error(
+                "Unexpected error fetching repository stats for %s: %s",
+                repo_id,
+                e,
+                exc_info=True
+            )
+            return None
 
