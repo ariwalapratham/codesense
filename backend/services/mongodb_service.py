@@ -296,14 +296,12 @@ class MongoDBService:
             # Get total count with search filter
             total = await self.repositories.count_documents(search_filter)
             
-            # Projection for lightweight summary fields
+            # Projection for lightweight summary fields (matching UI requirements)
             projection = {
-                "owner": 1,
                 "repo_name": 1,
                 "repository_url": 1,
-                "status": 1,
                 "files_processed": 1,
-                "chunks_count": 1,
+                "created_at": 1,
                 "updated_at": 1,
                 "_id": 1
             }

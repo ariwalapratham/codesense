@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Dict, List, Optional
 
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 
 
 class IngestionRequest(BaseModel):
@@ -13,16 +13,15 @@ class IngestionRequest(BaseModel):
     branch: Optional[str] = Field(None, description="Specific branch to clone (optional)")
     cleanup: bool = Field(True, description="Whether to cleanup temporary repository after processing")
 
-    class Config:
-        """Pydantic config."""
-
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "repo_url": "https://github.com/owner/repo.git",
                 "branch": "main",
                 "cleanup": True
             }
         }
+    )
 
 
 class IngestionResponse(BaseModel):
@@ -31,15 +30,14 @@ class IngestionResponse(BaseModel):
     success: bool = Field(..., description="Whether ingestion was successful")
     message: str = Field(..., description="Status message")
 
-    class Config:
-        """Pydantic config."""
-
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "success": True,
                 "message": "Successfully ingested repository owner_repo. Processed 50 files and created 200 chunks."
             }
         }
+    )
 
 
 class ParsingStatsResponse(BaseModel):
@@ -70,10 +68,8 @@ class RepositoryInfo(BaseModel):
     updated_at: datetime = Field(..., description="Last update timestamp")
     last_ingested_at: Optional[datetime] = Field(None, description="Last successful ingestion timestamp")
 
-    class Config:
-        """Pydantic config."""
-
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "id": "507f1f77bcf86cd799439011",
                 "owner": "owner",
@@ -97,18 +93,20 @@ class RepositoryInfo(BaseModel):
                 "last_ingested_at": "2024-01-01T00:00:00Z"
             }
         }
+    )
 
 
 class RepositorySummary(BaseModel):
-    """Lightweight summary for repository list endpoint."""
+    """Lightweight summary for repository list endpoint.
+    
+    Minimal fields for repository cards display.
+    """
 
     id: str = Field(..., description="Unique repository identifier (MongoDB ObjectId as string)")
-    owner: str = Field(..., description="Repository owner/username")
     repo_name: str = Field(..., description="Repository name")
-    repository_url: str = Field(..., description="Repository URL")
-    status: str = Field(..., description="Ingestion status")
-    files_processed: int = Field(..., description="Files processed during ingestion")
-    chunks_count: int = Field(..., description="Total chunks created")
+    repository_url: str = Field(..., description="Full repository URL")
+    files_processed: int = Field(..., description="Number of files processed")
+    created_at: datetime = Field(..., description="First ingestion timestamp")
     updated_at: datetime = Field(..., description="Last update timestamp")
 
 
@@ -120,21 +118,16 @@ class RepositoryListResponse(BaseModel):
     skip: int = Field(..., description="Number of repositories skipped")
     limit: int = Field(..., description="Maximum number of repositories returned")
 
-    class Config:
-        """Pydantic config."""
-
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "repositories": [
                     {
                         "id": "507f1f77bcf86cd799439011",
-                        "owner": "owner",
-                        "repo_name": "repo",
-                        "repository_url": "https://github.com/owner/repo.git",
-                        "status": "completed",
-                        "files_processed": 50,
-                        "chunks_count": 200,
-                        "updated_at": "2024-01-01T00:00:00Z"
+                        "repo_name": "react-dashboard",
+                        "repository_url": "https://github.com/owner/react-dashboard.git",
+                        "files_processed": 245,
+                        "created_at": "2024-01-15T00:00:00Z"
                     }
                 ],
                 "total": 1,
@@ -142,6 +135,7 @@ class RepositoryListResponse(BaseModel):
                 "limit": 10
             }
         }
+    )
 
 
 class RepositoryStats(BaseModel):
@@ -154,10 +148,8 @@ class RepositoryStats(BaseModel):
     language_distribution: Dict[str, int] = Field(..., description="Number of chunks per language")
     chunk_type_distribution: Dict[str, int] = Field(..., description="Number of chunks per type")
 
-    class Config:
-        """Pydantic config."""
-
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "id": "507f1f77bcf86cd799439011",
                 "repo_name": "repo",
@@ -174,3 +166,4 @@ class RepositoryStats(BaseModel):
                 }
             }
         }
+    )
