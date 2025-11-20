@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class ParsingStats(BaseModel):
@@ -19,7 +19,6 @@ class ParsingStats(BaseModel):
 class RepositorySchema(BaseModel):
     """Schema for repository documents in MongoDB."""
 
-    repo_id: str = Field(..., description="Unique repository identifier")
     owner: str = Field(..., description="Repository owner/username")
     repo_name: str = Field(..., description="Repository name")
     repository_url: str = Field(..., description="Full repository URL")
@@ -38,21 +37,18 @@ class RepositorySchema(BaseModel):
         None, description="Parsing statistics"
     )
     created_at: datetime = Field(
-        default_factory=datetime.utcnow, description="First ingestion timestamp"
+        default_factory=datetime.now, description="First ingestion timestamp"
     )
     updated_at: datetime = Field(
-        default_factory=datetime.utcnow, description="Last update timestamp"
+        default_factory=datetime.now, description="Last update timestamp"
     )
     last_ingested_at: Optional[datetime] = Field(
         None, description="Last successful ingestion timestamp"
     )
 
-    class Config:
-        """Pydantic config."""
-
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
-                "repo_id": "owner_repo",
                 "owner": "owner",
                 "repo_name": "repo",
                 "repository_url": "https://github.com/owner/repo.git",
@@ -69,9 +65,10 @@ class RepositorySchema(BaseModel):
                     "total_imports": 45,
                     "languages": ["python", "javascript"]
                 },
-                "created_at": "2024-01-01T00:00:00Z",
-                "updated_at": "2024-01-01T00:00:00Z",
-                "last_ingested_at": "2024-01-01T00:00:00Z"
+                "created_at": "",
+                "updated_at": "2025-11-20 16:21:33.151743",
+                "last_ingested_at": "2025-11-20 16:21:33.151743"
             }
         }
+    )
 

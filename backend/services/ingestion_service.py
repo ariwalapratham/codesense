@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
+from bson import ObjectId
 
 import aiofiles
 from git import Repo
@@ -55,7 +56,7 @@ class IngestionService:
             repo_url: Repository URL (GitHub/GitLab)
 
         Returns:
-            Tuple of (owner, repo_name, repo_id)
+            Tuple of (owner, repo_name, vector_store_id)
         """
         parsed = urlparse(repo_url)
         path_parts = parsed.path.strip("/").split("/")
@@ -66,11 +67,11 @@ class IngestionService:
         else:
             raise ValueError(f"Invalid repository URL format: {repo_url}")
 
-        # Create sanitized repo_id: owner_repo
-        repo_id = f"{owner}_{repo_name}".lower()
-        repo_id = re.sub(r"[^a-z0-9_]", "_", repo_id)
+        # Create sanitized vector_store_id: owner_repo (for FAISS vector store)
+        vector_store_id = f"{owner}_{repo_name}".lower()
+        vector_store_id = re.sub(r"[^a-z0-9_]", "_", vector_store_id)
 
-        return owner, repo_name, repo_id
+        return owner, repo_name, vector_store_id
 
     def _prepare_temp_repo_path(self, repo_name: str, commit_hash: Optional[str] = None) -> Path:
         """
@@ -226,7 +227,6 @@ class IngestionService:
 
     def _prepare_repository_data(
         self,
-        repo_id: str,
         owner: str,
         repo_name: str,
         repo_url: str,
@@ -241,7 +241,6 @@ class IngestionService:
         Prepare repository data for MongoDB upsert.
 
         Args:
-            repo_id: Repository identifier
             owner: Repository owner
             repo_name: Repository name
             repo_url: Repository URL
@@ -256,7 +255,6 @@ class IngestionService:
             Repository data dictionary
         """
         repo_data = {
-            "repo_id": repo_id,
             "owner": owner,
             "repo_name": repo_name,
             "repository_url": repo_url,
@@ -274,7 +272,7 @@ class IngestionService:
     def _prepare_chunks_data(
         self,
         embedded_chunks: List[Dict],
-        repo_id: str,
+        repo_object_id,
         repo_url: str,
         commit_hash: Optional[str],
         chunk_mapping: Dict[str, int]
@@ -284,7 +282,7 @@ class IngestionService:
 
         Args:
             embedded_chunks: List of chunks with embeddings
-            repo_id: Repository identifier
+            repo_object_id: Repository ObjectId (ObjectId or str)
             repo_url: Repository URL
             commit_hash: Commit hash
             chunk_mapping: Mapping of chunk_id to embedding_index
@@ -313,7 +311,7 @@ class IngestionService:
 
             chunk_data = {
                 "chunk_id": chunk_id,
-                "repo_id": repo_id,
+                "repo_id": repo_object_id if isinstance(repo_object_id, ObjectId) else ObjectId(repo_object_id),
                 "repository_url": repo_url,
                 "file_path": chunk["file_path"],
                 "function_name": chunk.get("function_name"),
@@ -333,7 +331,7 @@ class IngestionService:
     async def _store_embeddings(
         self,
         embedded_chunks: List[Dict],
-        repo_id: str,
+        vector_store_id: str,
         owner: str,
         repo_name: str,
         repo_url: str,
@@ -348,7 +346,7 @@ class IngestionService:
 
         Args:
             embedded_chunks: List of chunks with embeddings
-            repo_id: Repository identifier
+            vector_store_id: Vector store identifier (string, owner_repo format for FAISS)
             owner: Repository owner
             repo_name: Repository name
             repo_url: Original repository URL
@@ -361,22 +359,22 @@ class IngestionService:
         Returns:
             True if successful, False otherwise
         """
+        
         try:
-            # Store embeddings in FAISS
-            logger.info("Storing embeddings in FAISS for repository: %s", repo_id)
+            # Store embeddings in FAISS (uses vector_store_id: owner_repo format)
+            logger.info("Storing embeddings in FAISS for repository: %s", vector_store_id)
             faiss_success, chunk_mapping = await self.vector_store_service.save_embeddings(
                 embedded_chunks=embedded_chunks,
-                repo_id=repo_id,
+                repo_id=vector_store_id,
                 overwrite=True  # Always overwrite for single repo
             )
 
             if not faiss_success:
-                logger.error("Failed to store embeddings in FAISS for repository: %s", repo_id)
+                logger.error("Failed to store embeddings in FAISS for repository: %s", vector_store_id)
                 return False
 
-            # Prepare repository data
+            # Prepare repository data (without repo_id)
             repo_data = self._prepare_repository_data(
-                repo_id=repo_id,
                 owner=owner,
                 repo_name=repo_name,
                 repo_url=repo_url,
@@ -388,33 +386,34 @@ class IngestionService:
                 parsing_stats=parsing_stats
             )
 
-            # Upsert repository
-            logger.info("Upserting repository in MongoDB: %s", repo_id)
-            repo_success = await self.mongodb_service.upsert_repository(repo_data)
-            if not repo_success:
+            # Upsert repository and get ObjectId
+            logger.info("Upserting repository in MongoDB: %s/%s", owner, repo_name)
+            repo_object_id = await self.mongodb_service.upsert_repository(repo_data)
+            if not repo_object_id:
                 logger.warning("Failed to upsert repository in MongoDB, continuing...")
+                return False
 
-            # Prepare chunks data
+            # Prepare chunks data with ObjectId
             chunks_data = self._prepare_chunks_data(
                 embedded_chunks=embedded_chunks,
-                repo_id=repo_id,
+                repo_object_id=repo_object_id,
                 repo_url=repo_url,
                 commit_hash=commit_hash,
                 chunk_mapping=chunk_mapping
             )
 
             # Delete old chunks for this repo (since we're overwriting)
-            logger.info("Deleting old chunks for repository: %s", repo_id)
-            await self.mongodb_service.delete_chunks_by_repo(repo_id)
+            logger.info("Deleting old chunks for repository: %s", str(repo_object_id))
+            await self.mongodb_service.delete_chunks_by_repo(str(repo_object_id))
 
             # Upsert chunks
             logger.info("Upserting %d chunks in MongoDB for repository: %s",
-                len(chunks_data), repo_id)
+                len(chunks_data), str(repo_object_id))
             chunks_success = await self.mongodb_service.upsert_chunks(chunks_data)
             if not chunks_success:
                 logger.warning("Failed to upsert some chunks in MongoDB, continuing...")
 
-            logger.info("Stored %d chunks for repository %s", len(embedded_chunks), repo_id)
+            logger.info("Stored %d chunks for repository %s", len(embedded_chunks), str(repo_object_id))
             return True
 
         except (OSError, ValueError, KeyError) as e:
@@ -469,9 +468,9 @@ class IngestionService:
 
             # Step 1: Extract repository information
             try:
-                owner, repo_name, repo_id = self._extract_repo_info(repo_url)
-                logger.info("Repository info - Owner: %s, Name: %s, ID: %s",
-                    owner, repo_name, repo_id)
+                owner, repo_name, vector_store_id = self._extract_repo_info(repo_url)
+                logger.info("Repository info - Owner: %s, Name: %s, Vector Store ID: %s",
+                    owner, repo_name, vector_store_id)
             except ValueError as e:
                 error_msg = f"Failed to extract repository information: {e}"
                 logger.error("%s", error_msg)
@@ -593,7 +592,7 @@ class IngestionService:
             logger.info("Storing embeddings and metadata...")
             store_success = await self._store_embeddings(
                 embedded_chunks=embedded_chunks,
-                repo_id=repo_id,
+                vector_store_id=vector_store_id,
                 owner=owner,
                 repo_name=repo_name,
                 repo_url=repo_url,
@@ -617,7 +616,7 @@ class IngestionService:
                 await self._cleanup_temp_repo(repo_path)
 
             success_msg = (
-                f"Successfully ingested repository {repo_id}. "
+                f"Successfully ingested repository {vector_store_id}. "
                 f"Processed {len(code_files)} files and created {len(embedded_chunks)} chunks."
             )
             logger.info(success_msg)

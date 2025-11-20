@@ -55,7 +55,7 @@ class ParsingStatsResponse(BaseModel):
 class RepositoryInfo(BaseModel):
     """Response model for repository information."""
 
-    repo_id: str = Field(..., description="Unique repository identifier")
+    id: str = Field(..., description="Unique repository identifier (MongoDB ObjectId as string)")
     owner: str = Field(..., description="Repository owner/username")
     repo_name: str = Field(..., description="Repository name")
     repository_url: str = Field(..., description="Full repository URL")
@@ -75,7 +75,7 @@ class RepositoryInfo(BaseModel):
 
         json_schema_extra = {
             "example": {
-                "repo_id": "owner_repo",
+                "id": "507f1f77bcf86cd799439011",
                 "owner": "owner",
                 "repo_name": "repo",
                 "repository_url": "https://github.com/owner/repo.git",
@@ -99,10 +99,23 @@ class RepositoryInfo(BaseModel):
         }
 
 
+class RepositorySummary(BaseModel):
+    """Lightweight summary for repository list endpoint."""
+
+    id: str = Field(..., description="Unique repository identifier (MongoDB ObjectId as string)")
+    owner: str = Field(..., description="Repository owner/username")
+    repo_name: str = Field(..., description="Repository name")
+    repository_url: str = Field(..., description="Repository URL")
+    status: str = Field(..., description="Ingestion status")
+    files_processed: int = Field(..., description="Files processed during ingestion")
+    chunks_count: int = Field(..., description="Total chunks created")
+    updated_at: datetime = Field(..., description="Last update timestamp")
+
+
 class RepositoryListResponse(BaseModel):
     """Response model for paginated repository list."""
 
-    repositories: List[RepositoryInfo] = Field(..., description="List of repositories")
+    repositories: List[RepositorySummary] = Field(..., description="List of repositories")
     total: int = Field(..., description="Total number of repositories")
     skip: int = Field(..., description="Number of repositories skipped")
     limit: int = Field(..., description="Maximum number of repositories returned")
@@ -114,13 +127,14 @@ class RepositoryListResponse(BaseModel):
             "example": {
                 "repositories": [
                     {
-                        "repo_id": "owner_repo",
+                        "id": "507f1f77bcf86cd799439011",
                         "owner": "owner",
                         "repo_name": "repo",
                         "repository_url": "https://github.com/owner/repo.git",
                         "status": "completed",
                         "files_processed": 50,
-                        "chunks_count": 200
+                        "chunks_count": 200,
+                        "updated_at": "2024-01-01T00:00:00Z"
                     }
                 ],
                 "total": 1,
@@ -133,7 +147,7 @@ class RepositoryListResponse(BaseModel):
 class RepositoryStats(BaseModel):
     """Response model for repository statistics."""
 
-    repo_id: str = Field(..., description="Repository identifier")
+    id: str = Field(..., description="Repository identifier (MongoDB ObjectId as string)")
     repo_name: str = Field(..., description="Repository name")
     total_chunks: int = Field(..., description="Total number of chunks")
     total_files: int = Field(..., description="Total number of files")
@@ -145,7 +159,7 @@ class RepositoryStats(BaseModel):
 
         json_schema_extra = {
             "example": {
-                "repo_id": "owner_repo",
+                "id": "507f1f77bcf86cd799439011",
                 "repo_name": "repo",
                 "total_chunks": 200,
                 "total_files": 50,

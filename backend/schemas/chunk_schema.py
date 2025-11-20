@@ -2,9 +2,9 @@
 
 from datetime import datetime
 from typing import Optional
+from bson import ObjectId
 
-from pydantic import BaseModel, Field
-
+from pydantic import BaseModel, ConfigDict, Field
 
 class ChunkMetadata(BaseModel):
     """Metadata for a code chunk."""
@@ -31,7 +31,7 @@ class ChunkSchema(BaseModel):
     """Schema for chunk documents in MongoDB."""
 
     chunk_id: str = Field(..., description="Unique chunk identifier")
-    repo_id: str = Field(..., description="Repository identifier")
+    repo_id: ObjectId = Field(..., description="Reference to the repository document")
     repository_url: str = Field(..., description="Repository URL")
     file_path: str = Field(..., description="File path relative to repository")
     function_name: Optional[str] = Field(
@@ -54,16 +54,15 @@ class ChunkSchema(BaseModel):
         ..., description="Additional chunk metadata"
     )
     created_at: datetime = Field(
-        default_factory=datetime.utcnow, description="Creation timestamp"
+        default_factory=datetime.now, description="Creation timestamp"
     )
 
-    class Config:
-        """Pydantic config."""
-
-        json_schema_extra = {
+    model_config = ConfigDict(
+        arbitrary_types_allowed=True,
+        json_schema_extra={
             "example": {
                 "chunk_id": "chunk_abc123",
-                "repo_id": "owner_repo",
+                "repo_id": ObjectId("669999999999999999999999"),
                 "repository_url": "https://github.com/owner/repo.git",
                 "file_path": "src/main.py",
                 "function_name": "process_data",
@@ -81,7 +80,8 @@ class ChunkSchema(BaseModel):
                     "split_index": None,
                     "total_splits": None
                 },
-                "created_at": "2024-01-01T00:00:00Z"
+                "created_at": "2025-11-20 16:21:33.151743"
             }
         }
+    )
 

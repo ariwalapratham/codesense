@@ -9,6 +9,7 @@ from models.schemas import (
     ParsingStatsResponse,
     RepositoryInfo,
     RepositoryListResponse,
+    RepositorySummary,
     RepositoryStats,
 )
 from services.mongodb_service import MongoDBService
@@ -44,6 +45,25 @@ def _to_repository_info(repo_dict: Dict) -> Optional[RepositoryInfo]:
         return None
 
 
+def _to_repository_summary(repo_dict: Dict) -> RepositorySummary:
+    """
+    Convert a repository dictionary into RepositorySummary.
+
+    Args:
+        repo_dict: Raw repository dictionary
+
+    Returns:
+        RepositorySummary model
+
+    Raises:
+        ValueError: If conversion fails
+    """
+    try:
+        return RepositorySummary(**repo_dict)
+    except Exception as exc:  # pylint: disable=broad-except
+        raise ValueError(f"Invalid repository summary payload: {exc}") from exc
+
+
 @router.get(
     "/",
     response_model=RepositoryListResponse,
@@ -73,15 +93,20 @@ async def list_repositories(
             search=search,
         )
 
-        repo_infos = [
-            repo_info
-            for repo_dict in repositories
-            if (repo_info := _to_repository_info(repo_dict)) is not None
-        ]
+        repo_summaries = []
+        for repo_dict in repositories:
+            try:
+                repo_summaries.append(_to_repository_summary(repo_dict))
+            except ValueError as exc:
+                logger.error("Failed to convert repository summary: %s", exc, exc_info=True)
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Failed to convert repository summary document",
+                ) from exc
 
         logger.info(
             "Listed %d repositories (skip: %d, limit: %d, total: %d, search: %s)",
-            len(repo_infos),
+            len(repo_summaries),
             skip,
             limit,
             total,
@@ -89,7 +114,7 @@ async def list_repositories(
         )
 
         return RepositoryListResponse(
-            repositories=repo_infos,
+            repositories=repo_summaries,
             total=total,
             skip=skip,
             limit=limit,
@@ -114,10 +139,10 @@ async def get_repository(repo_id: str) -> RepositoryInfo:
     Get detailed information about a repository.
 
     Args:
-        repo_id: Repository identifier
+        repo_id: Repository identifier (MongoDB ObjectId as string)
 
     Returns:
-        RepositoryInfo object
+        RepositoryInfo object with id field (MongoDB ObjectId as string)
     """
     try:
         repo_dict = await mongodb_service.get_repository(repo_id)
@@ -158,10 +183,10 @@ async def get_repository_stats(repo_id: str) -> RepositoryStats:
     Get repository statistics including chunk and language distributions.
 
     Args:
-        repo_id: Repository identifier
+        repo_id: Repository identifier (MongoDB ObjectId as string)
 
     Returns:
-        RepositoryStats object
+        RepositoryStats object with id field (MongoDB ObjectId as string)
     """
     try:
         stats_dict = await mongodb_service.get_repository_stats(repo_id)
