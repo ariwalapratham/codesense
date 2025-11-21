@@ -104,48 +104,30 @@ class MongoDBService:
             logger.error("Failed to upsert repository: %s", e, exc_info=True)
             return None
 
-    async def check_repository_exists(
+    async def find_repository_by_owner_and_name(
         self,
         owner: str,
-        repo_name: str,
-        commit_hash: Optional[str] = None
+        repo_name: str
     ) -> Optional[Dict]:
         """
-        Check if a repository with the same owner, repo_name, and commit_hash exists.
+        Find a repository by owner and repo_name.
 
         Args:
             owner: Repository owner
             repo_name: Repository name
-            commit_hash: Optional commit hash to match
 
         Returns:
             Repository document if found, None otherwise
         """
         try:
-            query = {
-                "owner": owner,
-                "repo_name": repo_name
-            }
-            
-            if commit_hash:
-                query["commit_hash"] = commit_hash
-            
-            repo_doc = await self.repositories.find_one(query, {"_id": 1, "owner": 1, "repo_name": 1, "commit_hash": 1})
-            
-            if repo_doc:
-                logger.info(
-                    "Repository already exists: %s/%s (commit: %s)",
-                    owner,
-                    repo_name,
-                    commit_hash or "any"
-                )
-                return repo_doc
-            
-            return None
+            repo_doc = await self.repositories.find_one(
+                {"owner": owner, "repo_name": repo_name}
+            )
+            return repo_doc
 
         except Exception as e:
             logger.error(
-                "Failed to check repository existence: %s",
+                "Failed to find repository by owner and name: %s",
                 e,
                 exc_info=True
             )
@@ -253,6 +235,73 @@ class MongoDBService:
                 "Failed to delete chunks for repository %s: %s",
                 repo_id,
                 e
+            )
+            return False
+
+    async def delete_repository(self, repo_id: str) -> bool:
+        """
+        Delete a repository document by ID.
+
+        Args:
+            repo_id: Repository identifier (MongoDB ObjectId as string)
+
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            repo_object_id = self._to_object_id(repo_id)
+            result = await self.repositories.delete_one({"_id": repo_object_id})
+            
+            if result.deleted_count > 0:
+                logger.info("Deleted repository: %s", repo_id)
+                return True
+            else:
+                logger.warning("Repository not found for deletion: %s", repo_id)
+                return False
+
+        except Exception as e:
+            logger.error(
+                "Failed to delete repository %s: %s",
+                repo_id,
+                e,
+                exc_info=True
+            )
+            return False
+
+    async def delete_queries_by_repo(self, repo_id: str) -> bool:
+        """
+        Delete all queries associated with a repository.
+
+        Args:
+            repo_id: Repository identifier (MongoDB ObjectId as string)
+
+        Returns:
+            True if successful or if queries collection doesn't exist, False on error
+        """
+        try:
+            # Check if queries collection exists
+            collections = await mongodb.db.list_collection_names()
+            if "csQueries" not in collections:
+                logger.debug("Queries collection doesn't exist, skipping query deletion")
+                return True
+
+            queries_collection = mongodb.db["csQueries"]
+            repo_object_id = self._to_object_id(repo_id)
+            result = await queries_collection.delete_many({"repo_id": repo_object_id})
+            
+            logger.info(
+                "Deleted %d queries for repository: %s",
+                result.deleted_count,
+                repo_id
+            )
+            return True
+
+        except Exception as e:
+            logger.error(
+                "Failed to delete queries for repository %s: %s",
+                repo_id,
+                e,
+                exc_info=True
             )
             return False
 

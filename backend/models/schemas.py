@@ -50,6 +50,29 @@ class ParsingStatsResponse(BaseModel):
     languages: List[str] = Field(..., description="List of programming languages found")
 
 
+class DeleteRepositoryResponse(BaseModel):
+    """Response model for repository deletion."""
+
+    success: bool = Field(..., description="Whether deletion was successful")
+    message: str = Field(..., description="Status message")
+    details: Dict[str, bool] = Field(..., description="Status of each deletion step")
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "success": True,
+                "message": "Successfully deleted repository 507f1f77bcf86cd799439011 and all associated data",
+                "details": {
+                    "chunks_deleted": True,
+                    "queries_deleted": True,
+                    "vector_store_deleted": True,
+                    "repository_deleted": True
+                }
+            }
+        }
+    )
+
+
 class RepositoryInfo(BaseModel):
     """Response model for repository information."""
 

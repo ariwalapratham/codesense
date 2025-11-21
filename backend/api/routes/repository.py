@@ -6,12 +6,14 @@ from typing import Dict, Optional
 from fastapi import APIRouter, HTTPException, Query, status
 
 from models.schemas import (
+    DeleteRepositoryResponse,
     ParsingStatsResponse,
     RepositoryInfo,
     RepositoryListResponse,
     RepositorySummary,
     RepositoryStats,
 )
+from services.ingestion_service import IngestionService
 from services.mongodb_service import MongoDBService
 
 logger = logging.getLogger(__name__)
@@ -22,6 +24,7 @@ router = APIRouter(
 )
 
 mongodb_service = MongoDBService()
+ingestion_service = IngestionService()
 
 
 def _to_repository_info(repo_dict: Dict) -> Optional[RepositoryInfo]:
@@ -207,4 +210,57 @@ async def get_repository_stats(repo_id: str) -> RepositoryStats:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to fetch repository statistics: {exc}",
+        ) from exc
+
+
+@router.delete(
+    "/{repo_id}",
+    response_model=DeleteRepositoryResponse,
+    summary="Delete repository",
+    description="Delete a repository and all its associated data (chunks, queries, vector store).",
+)
+async def delete_repository(repo_id: str) -> DeleteRepositoryResponse:
+    """
+    Delete a repository and all its data.
+
+    Deletes:
+    - All code chunks
+    - All queries (if collection exists)
+    - Vector store files (FAISS index and mappings)
+    - Repository record
+
+    Args:
+        repo_id: Repository identifier (MongoDB ObjectId as string)
+
+    Returns:
+        DeleteRepositoryResponse with deletion status
+    """
+    try:
+        success, message, details = await ingestion_service.delete_repository(repo_id)
+        
+        if not success:
+            # Check if repository was not found
+            if "not found" in message.lower():
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=message,
+                )
+            # For partial deletions, return 207 Multi-Status or 200 with details
+            # Using 200 with success=False to show partial failure
+            logger.warning("Partial deletion for repository %s: %s", repo_id, message)
+
+        logger.info("Delete repository operation completed for: %s", repo_id)
+        return DeleteRepositoryResponse(
+            success=success,
+            message=message,
+            details=details
+        )
+
+    except HTTPException:
+        raise
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.error("Error deleting repository %s: %s", repo_id, exc, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to delete repository: {exc}",
         ) from exc

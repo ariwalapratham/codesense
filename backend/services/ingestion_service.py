@@ -420,6 +420,94 @@ class IngestionService:
             logger.error("Failed to store embeddings: %s", e, exc_info=True)
             return False
 
+    async def delete_repository(self, repo_id: str) -> Tuple[bool, str, Dict[str, bool]]:
+        """
+        Delete a repository and all its associated data.
+
+        Flow:
+        1. Delete all code chunks
+        2. Delete all queries (if collection exists)
+        3. Delete vector store files
+        4. Delete repository record
+
+        Args:
+            repo_id: Repository identifier (MongoDB ObjectId as string)
+
+        Returns:
+            Tuple of (success: bool, message: str, details: Dict[str, bool])
+        """
+        details = {
+            "chunks_deleted": False,
+            "queries_deleted": False,
+            "vector_store_deleted": False,
+            "repository_deleted": False
+        }
+
+        try:
+            # Get repository to extract owner and repo_name for vector_store_id
+            repo = await self.mongodb_service.get_repository(repo_id)
+            if not repo:
+                error_msg = f"Repository not found: {repo_id}"
+                logger.warning(error_msg)
+                return False, error_msg, details
+
+            owner = repo.get("owner")
+            repo_name = repo.get("repo_name")
+            
+            if not owner or not repo_name:
+                error_msg = f"Repository missing owner or repo_name: {repo_id}"
+                logger.error(error_msg)
+                return False, error_msg, details
+
+            # Generate vector_store_id (same logic as ingestion)
+            vector_store_id = f"{owner}_{repo_name}".lower()
+            vector_store_id = re.sub(r"[^a-z0-9_]", "_", vector_store_id)
+
+            logger.info("Starting deletion of repository: %s (vector_store_id: %s)", repo_id, vector_store_id)
+
+            # Step 1: Delete all chunks
+            logger.info("Deleting chunks for repository: %s", repo_id)
+            details["chunks_deleted"] = await self.mongodb_service.delete_chunks_by_repo(repo_id)
+
+            # Step 2: Delete all queries
+            logger.info("Deleting queries for repository: %s", repo_id)
+            details["queries_deleted"] = await self.mongodb_service.delete_queries_by_repo(repo_id)
+
+            # Step 3: Delete vector store files
+            logger.info("Deleting vector store for repository: %s", vector_store_id)
+            # Vector store delete_index is synchronous, run in executor
+            loop = asyncio.get_event_loop()
+            details["vector_store_deleted"] = await loop.run_in_executor(
+                None,
+                self.vector_store_service.delete_index,
+                vector_store_id
+            )
+
+            # Step 4: Delete repository record (last step)
+            logger.info("Deleting repository record: %s", repo_id)
+            details["repository_deleted"] = await self.mongodb_service.delete_repository(repo_id)
+
+            # Check overall success
+            all_succeeded = all(details.values())
+            
+            if all_succeeded:
+                success_msg = f"Successfully deleted repository {repo_id} and all associated data"
+                logger.info(success_msg)
+                return True, success_msg, details
+            else:
+                failed_steps = [k for k, v in details.items() if not v]
+                error_msg = (
+                    f"Partially deleted repository {repo_id}. "
+                    f"Failed steps: {', '.join(failed_steps)}"
+                )
+                logger.warning(error_msg)
+                return False, error_msg, details
+
+        except Exception as e:
+            error_msg = f"Failed to delete repository {repo_id}: {e}"
+            logger.error(error_msg, exc_info=True)
+            return False, error_msg, details
+
     async def _cleanup_temp_repo(self, repo_path: Path) -> bool:
         """
         Clean up temporary repository directory.
@@ -521,13 +609,12 @@ class IngestionService:
                         logger.warning("Failed to rename temp repo path: %s", e)
 
             # Step 4.5: Check if repository with same owner, repo_name, and commit_hash already exists
-            existing_repo = await self.mongodb_service.check_repository_exists(
+            existing_repo = await self.mongodb_service.find_repository_by_owner_and_name(
                 owner=owner,
-                repo_name=repo_name,
-                commit_hash=commit_hash
+                repo_name=repo_name
             )
             
-            if existing_repo:
+            if existing_repo and existing_repo.get("commit_hash") == commit_hash:
                 # Repository already ingested with same commit hash
                 if cleanup:
                     await self._cleanup_temp_repo(repo_path)
