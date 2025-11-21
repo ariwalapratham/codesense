@@ -104,6 +104,53 @@ class MongoDBService:
             logger.error("Failed to upsert repository: %s", e, exc_info=True)
             return None
 
+    async def check_repository_exists(
+        self,
+        owner: str,
+        repo_name: str,
+        commit_hash: Optional[str] = None
+    ) -> Optional[Dict]:
+        """
+        Check if a repository with the same owner, repo_name, and commit_hash exists.
+
+        Args:
+            owner: Repository owner
+            repo_name: Repository name
+            commit_hash: Optional commit hash to match
+
+        Returns:
+            Repository document if found, None otherwise
+        """
+        try:
+            query = {
+                "owner": owner,
+                "repo_name": repo_name
+            }
+            
+            if commit_hash:
+                query["commit_hash"] = commit_hash
+            
+            repo_doc = await self.repositories.find_one(query, {"_id": 1, "owner": 1, "repo_name": 1, "commit_hash": 1})
+            
+            if repo_doc:
+                logger.info(
+                    "Repository already exists: %s/%s (commit: %s)",
+                    owner,
+                    repo_name,
+                    commit_hash or "any"
+                )
+                return repo_doc
+            
+            return None
+
+        except Exception as e:
+            logger.error(
+                "Failed to check repository existence: %s",
+                e,
+                exc_info=True
+            )
+            return None
+
     async def upsert_chunks(self, chunks_data: List[Dict]) -> bool:
         """
         Upsert chunk documents in bulk.

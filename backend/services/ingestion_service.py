@@ -520,6 +520,25 @@ class IngestionService:
                     except OSError as e:
                         logger.warning("Failed to rename temp repo path: %s", e)
 
+            # Step 4.5: Check if repository with same owner, repo_name, and commit_hash already exists
+            existing_repo = await self.mongodb_service.check_repository_exists(
+                owner=owner,
+                repo_name=repo_name,
+                commit_hash=commit_hash
+            )
+            
+            if existing_repo:
+                # Repository already ingested with same commit hash
+                if cleanup:
+                    await self._cleanup_temp_repo(repo_path)
+                
+                success_msg = (
+                    f"Repository {vector_store_id} with commit {commit_hash} "
+                    f"has already been ingested."
+                )
+                logger.info(success_msg)
+                return True, success_msg
+
             # Step 5: Discover code files
             logger.info("Discovering code files...")
             code_files = await self._discover_code_files(repo_path)
