@@ -1,5 +1,5 @@
 """API routes module."""
 
-from api.routes import ingestion, repository
+from api.routes import chat, ingestion, repository
 
-__all__ = ["ingestion", "repository"]
+__all__ = ["chat", "ingestion", "repository"]

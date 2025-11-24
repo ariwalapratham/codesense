@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.routes import ingestion, repository
+from api.routes import chat, ingestion, repository
 from database.mongodb import mongodb
 
 # Setup logging
@@ -56,6 +56,7 @@ app.add_middleware(
 )
 
 # Include routers
+app.include_router(chat.router)
 app.include_router(ingestion.router)
 app.include_router(repository.router)
 

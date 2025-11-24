@@ -1,43 +1,9 @@
-"""Pydantic models for API requests and responses."""
+"""Pydantic schemas for repository endpoints."""
 
 from datetime import datetime
 from typing import Dict, List, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl
-
-
-class IngestionRequest(BaseModel):
-    """Request model for repository ingestion."""
-
-    repo_url: HttpUrl = Field(..., description="URL of the repository to ingest")
-    branch: Optional[str] = Field(None, description="Specific branch to clone (optional)")
-    cleanup: bool = Field(True, description="Whether to cleanup temporary repository after processing")
-
-    model_config = ConfigDict(
-        json_schema_extra={
-            "example": {
-                "repo_url": "https://github.com/owner/repo.git",
-                "branch": "main",
-                "cleanup": True
-            }
-        }
-    )
-
-
-class IngestionResponse(BaseModel):
-    """Response model for repository ingestion."""
-
-    success: bool = Field(..., description="Whether ingestion was successful")
-    message: str = Field(..., description="Status message")
-
-    model_config = ConfigDict(
-        json_schema_extra={
-            "example": {
-                "success": True,
-                "message": "Successfully ingested repository owner_repo. Processed 50 files and created 200 chunks."
-            }
-        }
-    )
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class ParsingStatsResponse(BaseModel):
@@ -66,8 +32,8 @@ class DeleteRepositoryResponse(BaseModel):
                     "chunks_deleted": True,
                     "queries_deleted": True,
                     "vector_store_deleted": True,
-                    "repository_deleted": True
-                }
+                    "repository_deleted": True,
+                },
             }
         }
     )
@@ -109,11 +75,11 @@ class RepositoryInfo(BaseModel):
                     "total_functions": 120,
                     "total_classes": 15,
                     "total_imports": 45,
-                    "languages": ["python", "javascript"]
+                    "languages": ["python", "javascript"],
                 },
                 "created_at": "2024-01-01T00:00:00Z",
                 "updated_at": "2024-01-01T00:00:00Z",
-                "last_ingested_at": "2024-01-01T00:00:00Z"
+                "last_ingested_at": "2024-01-01T00:00:00Z",
             }
         }
     )
@@ -121,7 +87,7 @@ class RepositoryInfo(BaseModel):
 
 class RepositorySummary(BaseModel):
     """Lightweight summary for repository list endpoint.
-    
+
     Minimal fields for repository cards display.
     """
 
@@ -150,12 +116,12 @@ class RepositoryListResponse(BaseModel):
                         "repo_name": "react-dashboard",
                         "repository_url": "https://github.com/owner/react-dashboard.git",
                         "files_processed": 245,
-                        "created_at": "2024-01-15T00:00:00Z"
+                        "created_at": "2024-01-15T00:00:00Z",
                     }
                 ],
                 "total": 1,
                 "skip": 0,
-                "limit": 10
+                "limit": 10,
             }
         }
     )
@@ -180,13 +146,14 @@ class RepositoryStats(BaseModel):
                 "total_files": 50,
                 "language_distribution": {
                     "python": 150,
-                    "javascript": 50
+                    "javascript": 50,
                 },
                 "chunk_type_distribution": {
                     "function": 120,
                     "class": 30,
-                    "module_level": 50
-                }
+                    "module_level": 50,
+                },
             }
         }
     )
+

@@ -10,7 +10,7 @@ from pymongo import UpdateOne
 from pymongo.errors import BulkWriteError, PyMongoError
 
 from database.mongodb import mongodb
-from schemas import ChunkSchema, RepositorySchema
+from schemas import ChatSessionSchema, ChunkSchema, RepositorySchema
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +22,7 @@ class MongoDBService:
         """Initialize MongoDB service with collections."""
         self.repositories = mongodb.db["csRepositories"]
         self.chunks = mongodb.db["csChunks"]
+        self.chat_sessions = mongodb.db["csChatSessions"]
 
     @staticmethod
     def _to_object_id(value: Union[str, ObjectId]) -> ObjectId:
@@ -103,6 +104,179 @@ class MongoDBService:
         except Exception as e:
             logger.error("Failed to upsert repository: %s", e, exc_info=True)
             return None
+
+    async def list_chat_sessions(
+        self, repo_id: str, skip: int = 0, limit: int = 10
+    ) -> Tuple[List[Dict], int]:
+        """
+        List chat sessions for a repository with pagination.
+
+        Args:
+            repo_id: Repository identifier
+            skip: Number of sessions to skip
+            limit: Maximum number of sessions to return
+
+        Returns:
+            Tuple of (list of session dictionaries, total count)
+        """
+        try:
+            repo_object_id = self._to_object_id(repo_id)
+            
+            # Get total count
+            total = await self.chat_sessions.count_documents({"repo_id": repo_object_id})
+            
+            # Fetch sessions with pagination
+            cursor = (
+                self.chat_sessions.find(
+                    {"repo_id": repo_object_id},
+                    {
+                        "_id": 0,
+                        "session_id": 1,
+                        "repo_id": 1,
+                        "title": 1,
+                        "created_at": 1,
+                        "updated_at": 1,
+                        "messages": {"$slice": -1},
+                    },
+                )
+                .sort("updated_at", -1)
+                .skip(skip)
+                .limit(limit)
+            )
+            sessions = await cursor.to_list(length=limit)
+            
+            for session in sessions:
+                session["repo_id"] = repo_id
+            
+            return sessions, total
+
+        except Exception as e:  # pylint: disable=broad-except
+            logger.error("Failed to list chat sessions for repo %s: %s", repo_id, e, exc_info=True)
+            return [], 0
+
+    async def create_chat_session(
+        self,
+        repo_id: str,
+        title: Optional[str] = None,
+        user_id: Optional[str] = None,
+    ) -> Optional[Dict]:
+        """Create a new chat session document."""
+        try:
+            repo_object_id = self._to_object_id(repo_id)
+            session_id = str(int(datetime.now().timestamp() * 1000))
+
+            session_schema = ChatSessionSchema(
+                session_id=session_id,
+                repo_id=repo_object_id,
+                user_id=ObjectId(user_id) if user_id else None,
+                title=title,
+            )
+            session_doc = session_schema.model_dump()
+            await self.chat_sessions.insert_one(session_doc)
+            session_doc["repo_id"] = repo_id
+            return session_doc
+
+        except Exception as e:  # pylint: disable=broad-except
+            logger.error("Failed to create chat session for repo %s: %s", repo_id, e, exc_info=True)
+            return None
+
+    async def update_chat_session(
+        self,
+        repo_id: str,
+        session_id: str,
+        updates: Dict,
+    ) -> bool:
+        """Update chat session metadata."""
+        try:
+            repo_object_id = self._to_object_id(repo_id)
+            updates["updated_at"] = datetime.now()
+            result = await self.chat_sessions.update_one(
+                {"repo_id": repo_object_id, "session_id": session_id},
+                {"$set": updates},
+            )
+            return result.matched_count > 0
+        except Exception as e:  # pylint: disable=broad-except
+            logger.error(
+                "Failed to update chat session %s for repo %s: %s",
+                session_id,
+                repo_id,
+                e,
+                exc_info=True,
+            )
+            return False
+
+    async def delete_chat_session(self, repo_id: str, session_id: str) -> bool:
+        """Delete a chat session and its messages."""
+        try:
+            repo_object_id = self._to_object_id(repo_id)
+            result = await self.chat_sessions.delete_one(
+                {"repo_id": repo_object_id, "session_id": session_id}
+            )
+            return result.deleted_count > 0
+        except Exception as e:  # pylint: disable=broad-except
+            logger.error(
+                "Failed to delete chat session %s for repo %s: %s",
+                session_id,
+                repo_id,
+                e,
+                exc_info=True,
+            )
+            return False
+
+    async def get_chat_messages(
+        self, repo_id: str, session_id: str, skip: int = 0, limit: int = 50
+    ) -> Tuple[List[Dict], int]:
+        """
+        Get chat messages for a session with pagination.
+
+        Args:
+            repo_id: Repository identifier
+            session_id: Chat session identifier
+            skip: Number of messages to skip
+            limit: Maximum number of messages to return
+
+        Returns:
+            Tuple of (list of message dictionaries, total count)
+        """
+        try:
+            repo_object_id = self._to_object_id(repo_id)
+            
+            # Find the session to get messages
+            session_doc = await self.chat_sessions.find_one(
+                {"repo_id": repo_object_id, "session_id": session_id},
+                {"messages": 1}
+            )
+            
+            if not session_doc:
+                logger.debug("Chat session not found: %s", session_id)
+                return [], 0
+            
+            messages = session_doc.get("messages", [])
+            total = len(messages)
+            
+            # Apply pagination (messages are already in chronological order)
+            paginated_messages = messages[skip : skip + limit]
+            
+            logger.debug(
+                "Retrieved %d messages for session %s (skip: %d, limit: %d, total: %d)",
+                len(paginated_messages),
+                session_id,
+                skip,
+                limit,
+                total,
+            )
+            
+            return paginated_messages, total
+
+        except Exception as e:  # pylint: disable=broad-except
+            logger.error(
+                "Failed to get chat messages for session %s in repo %s: %s",
+                session_id,
+                repo_id,
+                e,
+                exc_info=True,
+            )
+            return [], 0
 
     async def find_repository_by_owner_and_name(
         self,
@@ -458,7 +632,7 @@ class MongoDBService:
             if not repo:
                 logger.debug("Repository not found for stats: %s", repo_id)
                 return None
-            
+
             # Get total chunks count
             total_chunks = await self.chunks.count_documents({"repo_id": repo_object_id})
             
