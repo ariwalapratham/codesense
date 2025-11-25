@@ -2,7 +2,7 @@
 
 import asyncio
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -402,145 +402,59 @@ class EmbeddingService:
 
         # Process chunks in batches
         for i in range(0, total_chunks, batch_size):
-            batch = chunks[i:i + batch_size]
+            batch = chunks[i : i + batch_size]
             batch_texts = [chunk["code_text"] for chunk in batch]
 
             try:
-                # Generate embeddings for batch using new SDK (run in executor as API call may block)
-                # According to docs: https://ai.google.dev/gemini-api/docs/embeddings
-                # result.embeddings is always a list, even for single text
-                # Each embedding object has .values attribute
-                # Specify output_dimensionality=768 for consistent dimension (default is 3072)
-                loop = asyncio.get_event_loop()
-                
-                # Create a closure-safe function for executor
-                def generate_embeddings_sync(texts, use_config=True):
-                    if use_config and types is not None:
-                        return self.client.models.embed_content(
-                            model=self.embedding_model,
-                            contents=texts,
-                            config=types.EmbedContentConfig(output_dimensionality=768)
-                        )
-                    else:
-                        return self.client.models.embed_content(
-                            model=self.embedding_model,
-                            contents=texts
-                        )
-                
-                if types is not None:
-                    result = await loop.run_in_executor(
-                        None,
-                        generate_embeddings_sync,
-                        batch_texts,
-                        True
-                    )
-                else:
-                    # Fallback if types module not available (shouldn't happen if GEMINI_AVAILABLE)
-                    result = await loop.run_in_executor(
-                        None,
-                        generate_embeddings_sync,
-                        batch_texts,
-                        False
-                    )
-                
-                # Extract embeddings from response
-                # According to docs: result.embeddings is always a list of Embedding objects
-                # Each embedding object has .values attribute containing the embedding vector
-                embedding_list = []
-                
-                if not hasattr(result, 'embeddings'):
-                    logger.error("Response missing 'embeddings' attribute. Response type: %s, dir: %s", 
-                                type(result), dir(result))
-                    embedding_list = []
-                elif not result.embeddings:
-                    logger.error("Response has 'embeddings' but it's empty")
-                    embedding_list = []
-                else:
-                    logger.debug("Received %d embeddings in response", len(result.embeddings))
-                    for idx, embedding_obj in enumerate(result.embeddings):
-                        # Each embedding object has .values attribute
-                        if hasattr(embedding_obj, 'values'):
-                            embedding_values = list(embedding_obj.values)
-                            embedding_list.append(embedding_values)
-                            logger.debug("Embedding %d: length=%d", idx, len(embedding_values))
-                        else:
-                            logger.warning("Embedding object %d missing .values attribute: %s, dir: %s", 
-                                         idx, type(embedding_obj), dir(embedding_obj))
-                            embedding_list.append([])
-                
-                # Validate we got the expected number of embeddings
-                if len(embedding_list) != len(batch_texts):
-                    logger.warning(
-                        "Mismatch in embedding count: expected %d, got %d",
-                        len(batch_texts), len(embedding_list)
-                    )
-
-                # Attach embeddings to chunks with validation
-                for idx, chunk in enumerate(batch):
-                    if idx < len(embedding_list) and embedding_list[idx]:
-                        embedding = embedding_list[idx]
-                        
-                        # Validate embedding format and content
-                        if not isinstance(embedding, (list, np.ndarray)):
-                            logger.warning(
-                                "Invalid embedding type for chunk %s: %s",
-                                chunk.get("chunk_id"), type(embedding)
-                            )
-                            chunk["embedding"] = None
-                            embedded_chunks.append(chunk)
-                            continue
-                        
-                        # Convert to numpy array for validation
-                        embedding_array = np.array(embedding, dtype=np.float32)
-                        
-                        # Validate embedding (check for NaN/Inf)
-                        if np.any(np.isnan(embedding_array)) or np.any(np.isinf(embedding_array)):
-                            logger.warning(
-                                "Invalid embedding detected (NaN/Inf) for chunk %s, skipping",
-                                chunk.get("chunk_id")
-                            )
-                            chunk["embedding"] = None
-                            embedded_chunks.append(chunk)
-                            continue
-                        
-                        # Check embedding dimension (should be 768 if output_dimensionality=768 was specified)
-                        # Accept 768 (requested) or 3072 (default) as valid dimensions
-                        if len(embedding_array) not in (768, 3072):
-                            logger.warning(
-                                "Unexpected embedding dimension %d (expected 768 or 3072) for chunk %s",
-                                len(embedding_array), chunk.get("chunk_id")
-                            )
-                        elif len(embedding_array) == 3072:
-                            logger.debug(
-                                "Received 3072-dim embedding for chunk %s (requested 768, using default)",
-                                chunk.get("chunk_id")
-                            )
-                        
-                        chunk["embedding"] = embedding
-                        embedded_chunks.append(chunk)
-                    else:
-                        logger.warning(
-                            "No embedding generated for chunk %s",
-                            chunk.get("chunk_id")
-                        )
-                        chunk["embedding"] = None
-                        embedded_chunks.append(chunk)
-
-                logger.debug(
-                    "Generated embeddings for batch %d-%d/%d",
-                    i + 1, min(i + batch_size, total_chunks), total_chunks
-                )
-
-            except Exception as e:
+                embedding_list = await self.generate_text_embeddings(batch_texts, allow_empty=True)
+            except Exception as e:  # pylint: disable=broad-except
                 logger.error(
                     "Failed to generate embeddings for batch %d-%d: %s",
-                    i + 1, min(i + batch_size, total_chunks), e,
-                    exc_info=True
+                    i + 1,
+                    min(i + batch_size, total_chunks),
+                    e,
+                    exc_info=True,
                 )
-                # Add chunks without embeddings
-                for chunk in batch:
+                embedding_list = [[] for _ in batch]
+
+            if len(embedding_list) != len(batch):
+                logger.warning(
+                    "Mismatch in embedding count: expected %d, got %d",
+                    len(batch),
+                    len(embedding_list),
+                )
+                # pad/truncate
+                if len(embedding_list) < len(batch):
+                    embedding_list.extend([[] for _ in range(len(batch) - len(embedding_list))])
+                else:
+                    embedding_list = embedding_list[: len(batch)]
+
+            for idx, chunk in enumerate(batch):
+                embedding = embedding_list[idx]
+                if embedding:
+                    embedding_array = np.array(embedding, dtype=np.float32)
+                    if np.any(np.isnan(embedding_array)) or np.any(np.isinf(embedding_array)):
+                        logger.warning(
+                            "Invalid embedding detected (NaN/Inf) for chunk %s, skipping",
+                            chunk.get("chunk_id"),
+                        )
+                        chunk["embedding"] = None
+                    else:
+                        chunk["embedding"] = embedding
+                else:
+                    logger.warning(
+                        "No embedding generated for chunk %s",
+                        chunk.get("chunk_id"),
+                    )
                     chunk["embedding"] = None
-                    embedded_chunks.append(chunk)
+                embedded_chunks.append(chunk)
+
+            logger.debug(
+                "Generated embeddings for batch %d-%d/%d",
+                i + 1,
+                min(i + batch_size, total_chunks),
+                total_chunks,
+            )
 
         successful = sum(1 for chunk in embedded_chunks if chunk.get("embedding") is not None)
         logger.info(
@@ -572,3 +486,58 @@ class EmbeddingService:
         embedded_chunks = await self.generate_embeddings(chunks, batch_size=batch_size)
 
         return embedded_chunks
+
+    async def generate_text_embedding(self, text: str) -> List[float]:
+        """Generate a single text embedding."""
+        embeddings = await self.generate_text_embeddings([text])
+        if not embeddings or not embeddings[0]:
+            raise RuntimeError("Failed to generate embedding for text input.")
+        return embeddings[0]
+
+    async def generate_text_embeddings(
+        self,
+        texts: Sequence[str],
+        allow_empty: bool = False,
+        batch_size: int = 10,
+    ) -> List[List[float]]:
+        """
+        Generate embeddings for a list of arbitrary texts.
+
+        Args:
+            texts: Sequence of strings to embed.
+            allow_empty: If False, raise when service unavailable; if True return [].
+            batch_size: Number of texts per Gemini request.
+        """
+        if not texts:
+            return []
+        if not self.gemini_available or not self.client or not self.embedding_model:
+            if allow_empty:
+                return [[] for _ in texts]
+            raise RuntimeError("Gemini embedding service is not configured.")
+
+        embeddings: List[List[float]] = []
+        for i in range(0, len(texts), batch_size):
+            batch = list(texts[i : i + batch_size])
+            batch_embeddings = await self._embed_text_batch(batch)
+            embeddings.extend(batch_embeddings)
+        return embeddings
+
+    async def _embed_text_batch(self, texts: List[str]) -> List[List[float]]:
+        """Internal helper that calls Gemini to embed a batch of texts."""
+        loop = asyncio.get_running_loop()
+
+        def _embed_sync(batch_texts: List[str]) -> List[List[float]]:
+            kwargs = {"model": self.embedding_model, "contents": batch_texts}
+            if types is not None:
+                kwargs["config"] = types.EmbedContentConfig(output_dimensionality=768)
+            response = self.client.models.embed_content(**kwargs)
+            embedding_objs = getattr(response, "embeddings", []) or []
+            results: List[List[float]] = []
+            for idx in range(len(batch_texts)):
+                if idx < len(embedding_objs) and hasattr(embedding_objs[idx], "values"):
+                    results.append(list(embedding_objs[idx].values))
+                else:
+                    results.append([])
+            return results
+
+        return await loop.run_in_executor(None, _embed_sync, texts)

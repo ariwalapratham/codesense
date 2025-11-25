@@ -10,7 +10,7 @@ from pymongo import UpdateOne
 from pymongo.errors import BulkWriteError, PyMongoError
 
 from database.mongodb import mongodb
-from schemas import ChatSessionSchema, ChunkSchema, RepositorySchema
+from schemas import ChatSessionSchema, ChunkSchema, RepositorySchema, ChatMessageDocument
 
 logger = logging.getLogger(__name__)
 
@@ -222,6 +222,94 @@ class MongoDBService:
                 exc_info=True,
             )
             return False
+
+    async def get_chat_session(self, repo_id: str, session_id: str) -> Optional[Dict]:
+        """
+        Fetch a chat session document by repository and session identifiers.
+        """
+        try:
+            repo_object_id = self._to_object_id(repo_id)
+            session_doc = await self.chat_sessions.find_one(
+                {"repo_id": repo_object_id, "session_id": session_id}
+            )
+            if session_doc:
+                session_doc.pop("_id", None)
+                session_doc["repo_id"] = repo_id
+            return session_doc
+        except Exception as e:  # pylint: disable=broad-except
+            logger.error(
+                "Failed to fetch chat session %s for repo %s: %s",
+                session_id,
+                repo_id,
+                e,
+                exc_info=True,
+            )
+            return None
+
+    async def append_chat_message(
+        self,
+        repo_id: str,
+        session_id: str,
+        message: Dict,
+    ) -> bool:
+        """
+        Append a chat message to a session.
+        """
+        try:
+            repo_object_id = self._to_object_id(repo_id)
+            message_doc = ChatMessageDocument(**message).model_dump()
+            result = await self.chat_sessions.update_one(
+                {"repo_id": repo_object_id, "session_id": session_id},
+                {
+                    "$push": {"messages": message_doc},
+                    "$set": {"updated_at": datetime.now()},
+                },
+            )
+            if result.matched_count == 0:
+                logger.warning(
+                    "Chat session not found when appending message (repo=%s, session=%s)",
+                    repo_id,
+                    session_id,
+                )
+            return result.modified_count > 0
+        except Exception as e:  # pylint: disable=broad-except
+            logger.error(
+                "Failed to append chat message for session %s in repo %s: %s",
+                session_id,
+                repo_id,
+                e,
+                exc_info=True,
+            )
+            return False
+
+    async def fetch_recent_chat_messages(
+        self,
+        repo_id: str,
+        session_id: str,
+        limit: int = 10,
+    ) -> List[Dict]:
+        """
+        Fetch the most recent chat messages for a session.
+        """
+        try:
+            repo_object_id = self._to_object_id(repo_id)
+            session_doc = await self.chat_sessions.find_one(
+                {"repo_id": repo_object_id, "session_id": session_id},
+                {"messages": {"$slice": -limit}},
+            )
+            if not session_doc:
+                return []
+
+            return session_doc.get("messages", [])
+        except Exception as e:  # pylint: disable=broad-except
+            logger.error(
+                "Failed to fetch recent messages for session %s in repo %s: %s",
+                session_id,
+                repo_id,
+                e,
+                exc_info=True,
+            )
+            return []
 
     async def get_chat_messages(
         self, repo_id: str, session_id: str, skip: int = 0, limit: int = 50
@@ -687,4 +775,3 @@ class MongoDBService:
                 exc_info=True
             )
             return None
-

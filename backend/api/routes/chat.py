@@ -15,7 +15,7 @@ from models.schemas import (
     ChatSessionSummary,
     ChatSessionUpdateRequest,
 )
-from services.chat_service import ChatService
+from services.chat_service import ChatService, ChatServiceError
 from services.mongodb_service import MongoDBService
 
 logger = logging.getLogger(__name__)
@@ -144,8 +144,7 @@ async def update_chat_session(
                 detail="Chat session not found",
             )
 
-        sessions, _ = await mongodb_service.list_chat_sessions(repo_id, skip=0, limit=1000)
-        session_doc = next((s for s in sessions if s["session_id"] == session_id), None)
+        session_doc = await mongodb_service.get_chat_session(repo_id, session_id)
         if not session_doc:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -302,6 +301,8 @@ async def send_message(
 
     except HTTPException:
         raise
+    except ChatServiceError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
     except NotImplementedError as exc:
         logger.warning("ChatService not implemented: %s", exc)
         raise HTTPException(
