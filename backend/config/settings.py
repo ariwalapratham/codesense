@@ -10,7 +10,8 @@ class Settings(BaseSettings):
     # Gemini Configuration
     gemini_api_key: Optional[str] = None
     gemini_embedding_model: str = "gemini-embedding-001"
-    gemini_llm_model: str = "gemini-pro"
+    gemini_llm_model: str = "gemini-2.5-flash"
+    gemini_llm_fallback_model: str = "gemini-2.5-flash-lite"
 
     # MongoDB Configuration
     mongodb_url: str = "mongodb://localhost:27017"
