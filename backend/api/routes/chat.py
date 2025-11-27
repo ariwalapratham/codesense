@@ -2,7 +2,7 @@
 
 import logging
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, status
 
 from models.schemas import (
     ChatMessageItem,
@@ -275,6 +275,7 @@ async def send_message(
     repo_id: str,
     session_id: str,
     payload: ChatMessageRequest,
+    background_tasks: BackgroundTasks,
 ) -> ChatMessageResponse:
     """
     Entry point for chat messages.
@@ -283,6 +284,7 @@ async def send_message(
         repo_id: Repository identifier (Mongo ObjectId as string).
         session_id: Chat session identifier (UUID/string).
         payload: Request body containing user message (and optional flags).
+        background_tasks: FastAPI background tasks for async operations.
 
     Returns:
         Assistant response payload (non-streaming placeholder for now).
@@ -290,13 +292,45 @@ async def send_message(
     try:
         user_message = payload.message
 
-        # TODO: Support streaming (SSE/WebSockets). For now, call the chat service directly.
+        # Get session to check message count for background tasks (before processing)
+        session_doc = await mongodb_service.get_chat_session(repo_id, session_id)
+        if not session_doc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Chat session not found",
+            )
+
+        messages_before = session_doc.get("messages", [])
+        is_first_message = len(messages_before) == 0  # No messages yet
+
+        # TODO(qa): Support streaming (SSE/WebSockets). For now, call the chat service directly.
         response = await chat_service.process_message(
             repo_id=repo_id,
             session_id=session_id,
             user_message=user_message,
             stream=payload.stream,
         )
+
+        # Add background tasks after response is sent
+        if is_first_message:
+            # Generate title from first message
+            background_tasks.add_task(
+                chat_service.generate_title_background,
+                repo_id=repo_id,
+                session_id=session_id,
+                first_user_message=user_message,
+            )
+
+        # Check if summary generation is needed
+        # After processing, we'll have 2 more messages (user + assistant)
+        total_after = len(messages_before) + 2
+        if chat_service.should_generate_summary(total_after):
+            background_tasks.add_task(
+                chat_service.generate_summary_background,
+                repo_id=repo_id,
+                session_id=session_id,
+            )
+
         return ChatMessageResponse(**response)
 
     except HTTPException:

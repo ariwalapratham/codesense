@@ -1,5 +1,7 @@
 """Prompts for the LLM service."""
 
+from typing import Optional
+
 SYSTEM_INSTRUCTIONS = """
 You are Codesense, an expert AI code assistant specialized in repository analysis and code comprehension.
 
@@ -55,3 +57,57 @@ IMPORTANT:
 - Always use [ref #] citations for factual claims about the code
 - If context is incomplete, acknowledge it: "Based on the available context, I can see X, but I don't have information about Y."
 """
+
+
+def build_summary_prompt(existing_summary: Optional[str], messages_text: str) -> str:
+    """
+    Build prompt for conversation summary generation.
+
+    Args:
+        existing_summary: Previous conversation summary (if any)
+        messages_text: Formatted text of messages to summarize
+
+    Returns:
+        Complete summary generation prompt
+    """
+    if existing_summary:
+        prompt = (
+            "Previous conversation summary:\n"
+            f"{existing_summary}\n\n"
+            "Additional messages to incorporate:\n"
+            f"{messages_text}\n\n"
+            "Generate a concise summary (2-3 sentences) that incorporates the "
+            "previous summary with these new messages. "
+            "Focus on key topics, decisions, and important information."
+            "Return only the summary, nothing else."
+        )
+        return prompt
+    else:
+        prompt = (
+            "Summarize the following conversation in 2-3 sentences, focusing on the main topic"
+            "and key points:\n\n"
+            f"{messages_text}\n\n"
+            "Return only the summary, nothing else."
+        )
+        return prompt
+
+
+TITLE_GENERATION_PROMPT = (
+    "Generate a short, descriptive title (maximum 5-6 words) for a code chat "
+    "conversation that starts with this question:\n\n"
+    '"{first_message}"\n\n'
+    "Return only the title, nothing else. Keep it concise and focused on the main topic."
+)
+
+
+def build_title_prompt(first_message: str) -> str:
+    """
+    Build prompt for generating a chat session title.
+
+    Args:
+        first_message: The first user message in the conversation
+
+    Returns:
+        Complete title generation prompt
+    """
+    return TITLE_GENERATION_PROMPT.format(first_message=first_message)

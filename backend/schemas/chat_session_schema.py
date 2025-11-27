@@ -35,14 +35,21 @@ class ChatMessageDocument(BaseModel):
 class ChatSessionSchema(BaseModel):
     """Schema for chat session documents."""
 
-    session_id: str = Field(..., description="Public chat session identifier (unix timestamp string)")
-    user_id: Optional[ObjectId] = Field(default=None, description="User identifier (reserved for multi-user)")
+    session_id: str = Field(..., description="Public chat session identifier (unix timestamp)")
+    user_id: Optional[ObjectId] = Field(default=None, description="User identifier")
     repo_id: ObjectId = Field(..., description="Repository identifier")
     title: Optional[str] = Field(default=None, description="Session title")
     summary: Optional[str] = Field(default=None, description="Rolling memory summary")
-    created_at: datetime = Field(default_factory=datetime.utcnow, description="Creation timestamp")
-    updated_at: datetime = Field(default_factory=datetime.utcnow, description="Last update timestamp")
-    messages: List[ChatMessageDocument] = Field(default_factory=list, description="Embedded chat messages")
+    last_summarized_count: int = Field(default=0,
+        ge=0,
+        le=100,
+        description="Number of messages that have been summarized",
+    )
+    created_at: datetime = Field(default_factory=datetime.now(), description="Creation timestamp")
+    updated_at: datetime = Field(default_factory=datetime.now(),
+        description="Last update timestamp")
+    messages: List[ChatMessageDocument] = Field(default_factory=list,
+        description="Embedded chat messages")
 
     model_config = ConfigDict(
         arbitrary_types_allowed=True,
@@ -70,4 +77,3 @@ class ChatSessionSchema(BaseModel):
             }
         },
     )
-

@@ -9,6 +9,7 @@ from uuid import uuid4
 from services.llm_service import LLMService
 from services.mongodb_service import MongoDBService
 from services.retrieval_service import RetrievalService
+from utils.prompts import build_summary_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,7 @@ class ChatService:
         self.retrieval_top_k = 15
         self.max_context_snippets = 6
         self.min_similarity_score = 0.15
+        self.summary_batch_size = 10  # Summarize when we have 10+ old messages
 
     async def process_message(
         self,
@@ -144,7 +146,6 @@ class ChatService:
 
         return {
             "message_id": assistant_message_id,
-            "role": "assistant",
             "content": assistant_content,
             "references": references,
             "metadata": response_metadata,
@@ -227,4 +228,142 @@ class ChatService:
         vector_id = re.sub(r"_+", "_", vector_id).strip("_")
         return vector_id
 
+    def should_generate_summary(self, total_messages: int) -> bool:
+        """
+        Determine if summary generation should be triggered.
 
+        Returns True if:
+        - Total messages > history_limit AND
+        - We have accumulated enough old messages (batch_size) since last summary
+        """
+        if total_messages <= self.history_message_limit:
+            return False  # Not enough messages yet
+
+        old_message_count = total_messages - self.history_message_limit
+        # Only summarize when we have accumulated enough messages
+        return old_message_count >= self.summary_batch_size
+
+    async def generate_summary_background(
+        self,
+        repo_id: str,
+        session_id: str,
+    ) -> None:
+        """
+        Background task to generate/update conversation summary.
+
+        This runs asynchronously after the response is sent to the user.
+        It takes existing summary + older messages and generates a new summary.
+        """
+        try:
+            # Get all messages
+            all_messages, total = await self.mongodb_service.get_chat_messages(
+                repo_id=repo_id,
+                session_id=session_id,
+                skip=0,
+                limit=1000,
+            )
+
+            if not self.should_generate_summary(total):
+                return  # Not enough messages to summarize yet
+
+            # Get existing summary and last_summarized_count
+            session_doc = await self.mongodb_service.get_chat_session(repo_id, session_id)
+            existing_summary = session_doc.get("summary")
+            last_summarized_count = session_doc.get("last_summarized_count", 0)
+
+            # Messages beyond recent limit
+            old_messages = all_messages[: -(self.history_message_limit + 1)]
+
+            if not old_messages:
+                return
+
+            # Get messages that haven't been summarized yet
+            new_messages_to_summarize = old_messages[last_summarized_count:]
+
+            if not new_messages_to_summarize:
+                return  # All messages already summarized
+
+            # Build summary prompt
+            summary_prompt = self._build_summary_prompt(existing_summary, new_messages_to_summarize)
+
+            # Generate summary
+            new_summary = await self.llm_service.generate_summary(summary_prompt)
+
+            if new_summary:
+                # Update both summary and last_summarized_count
+                await self.mongodb_service.update_chat_session(
+                    repo_id=repo_id,
+                    session_id=session_id,
+                    updates={
+                        "summary": new_summary,
+                        "last_summarized_count": len(old_messages),
+                    },
+                )
+                logger.info(
+                    "Generated summary for session %s (repo=%s, %d old messages)",
+                    session_id,
+                    repo_id,
+                    len(old_messages),
+                )
+        except Exception as e:
+            logger.error(
+                "Failed to generate summary in background (repo=%s, session=%s): %s",
+                repo_id,
+                session_id,
+                e,
+                exc_info=True,
+            )
+            # Don't raise - this is a background task
+
+    def _build_summary_prompt(
+        self, existing_summary: Optional[str], messages: List[Dict]
+    ) -> str:
+        """Build prompt for summary generation."""
+        messages_text = "\n".join(
+            [
+                f"{msg.get('role', 'user').capitalize()}: {msg.get('content', '')}"
+                for msg in messages
+            ]
+        )
+        return build_summary_prompt(existing_summary, messages_text)
+
+    async def generate_title_background(
+        self,
+        repo_id: str,
+        session_id: str,
+        first_user_message: str,
+    ) -> None:
+        """
+        Background task to generate a title for a new chat session.
+
+        Uses the first user message to generate a concise title.
+        """
+        try:
+            # Check if title is still default
+            session_doc = await self.mongodb_service.get_chat_session(repo_id, session_id)
+            current_title = session_doc.get("title")
+
+            # Only update if it's still "New Chat" or None
+            if current_title and current_title.lower() not in ["new chat", "new", ""]:
+                return  # Title already set
+
+            # Generate title from first message
+            title = await self.llm_service.generate_title(first_user_message)
+
+            if title:
+                await self.mongodb_service.update_chat_session(
+                    repo_id=repo_id,
+                    session_id=session_id,
+                    updates={"title": title},
+                )
+                logger.info("Generated title '%s' for session %s (repo=%s)",
+                                title, session_id, repo_id)
+        except Exception as e:
+            logger.error(
+                "Failed to generate title in background (repo=%s, session=%s): %s",
+                repo_id,
+                session_id,
+                e,
+                exc_info=True,
+            )
+            # Don't raise - this is a background task

@@ -12,7 +12,7 @@ except ImportError:
     GEMINI_AVAILABLE = False
 
 from config.settings import settings
-from utils.prompts import SYSTEM_INSTRUCTIONS
+from utils.prompts import SYSTEM_INSTRUCTIONS, build_title_prompt
 logger = logging.getLogger(__name__)
 
 
@@ -39,7 +39,7 @@ class LLMService:
             if not GEMINI_AVAILABLE:
                 logger.warning("google-genai not available. LLM responses will not be generated.")
             elif not settings.gemini_api_key:
-                logger.warning("Gemini API key not configured. LLM responses will not be generated.")
+                logger.warning("Gemini API key not available. LLM responses will not be generated.")
 
     async def generate_chat_response(
         self,
@@ -118,7 +118,7 @@ class LLMService:
                         exc_info=True,
                     )
                     raise RuntimeError(
-                        f"Both primary and fallback models failed. Last error: {str(fallback_error)}"
+                        f"Both primary and fallback models failed. Last error:{str(fallback_error)}"
                     ) from fallback_error
             else:
                 logger.error("Failed to generate LLM response: %s", e, exc_info=True)
@@ -170,7 +170,7 @@ class LLMService:
     def _is_retryable_error(self, error: Exception) -> bool:
         """
         Check if an error is retryable with a fallback model.
-        
+
         Retryable errors include:
         - Rate limit errors (429)
         - Quota exceeded errors
@@ -179,7 +179,7 @@ class LLMService:
         """
         error_str = str(error).lower()
         error_type = type(error).__name__.lower()
-        
+
         # Check for rate limit indicators
         retryable_indicators = [
             "rate limit",
@@ -195,8 +195,11 @@ class LLMService:
             "too many requests",
             "throttled",
         ]
-        
-        return any(indicator in error_str or indicator in error_type for indicator in retryable_indicators)
+
+        return any(
+            indicator in error_str or indicator in error_type
+            for indicator in retryable_indicators
+        )
 
     async def _call_gemini(self, prompt: str, model: Optional[str] = None) -> Dict:
         """
@@ -204,7 +207,7 @@ class LLMService:
 
         According to the Gemini API documentation:
         https://ai.google.dev/gemini-api/docs/text-generation
-        
+
         The generate_content method is synchronous, so we use run_in_executor
         to make it non-blocking in an async context.
 
@@ -236,16 +239,16 @@ class LLMService:
                     model=model,
                     contents=prompt,
                 )
-                
+
                 # Extract response text
                 content = response.text if hasattr(response, "text") else ""
-                
+
                 # Extract metadata if available
                 metadata = {
                     "model": model,
                     "provider": "gemini",
                 }
-                
+
                 # Try to extract token usage if available
                 if hasattr(response, "usage_metadata"):
                     usage = response.usage_metadata
@@ -254,7 +257,7 @@ class LLMService:
                         "completion": getattr(usage, "completion_token_count", 0),
                         "total": getattr(usage, "total_token_count", 0),
                     }
-                
+
                 return {
                     "content": content,
                     "metadata": metadata,
@@ -271,3 +274,55 @@ class LLMService:
 
         # Run the synchronous call in an executor to make it async-friendly
         return await loop.run_in_executor(None, _generate_sync)
+
+    async def generate_summary(self, prompt: str) -> str:
+        """
+        Generate a conversation summary from a prompt.
+
+        Args:
+            prompt: The summary generation prompt.
+
+        Returns:
+            Generated summary text, or empty string on failure.
+        """
+        if not self.gemini_available:
+            logger.warning("Gemini not available, cannot generate summary")
+            return ""
+
+        try:
+            response = await self._call_gemini(prompt, model=self.model_name)
+            summary = response.get("content", "").strip()
+            return summary
+        except Exception as e:
+            logger.error("Failed to generate summary: %s", e, exc_info=True)
+            return ""
+
+    async def generate_title(self, first_message: str) -> str:
+        """
+        Generate a short title from the first user message.
+
+        Args:
+            first_message: The first user message in the conversation.
+
+        Returns:
+            Generated title, or empty string on failure.
+        """
+        if not self.gemini_available:
+            logger.warning("Gemini not available, cannot generate title")
+            return ""
+
+        prompt = build_title_prompt(first_message)
+
+        try:
+            response = await self._call_gemini(prompt, model=self.model_name)
+            title = response.get("content", "").strip()
+
+            # Clean up title (remove quotes, limit length)
+            title = title.strip('"\'')
+            if len(title) > 50:
+                title = title[:47] + "..."
+
+            return title
+        except Exception as e:
+            logger.error("Failed to generate title: %s", e, exc_info=True)
+            return ""
