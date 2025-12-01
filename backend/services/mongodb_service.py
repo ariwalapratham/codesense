@@ -10,7 +10,13 @@ from pymongo import UpdateOne
 from pymongo.errors import BulkWriteError, PyMongoError
 
 from database.mongodb import mongodb
-from schemas import ChatSessionSchema, ChunkSchema, RepositorySchema, ChatMessageDocument
+from schemas import (
+    ChatSessionSchema,
+    ChunkSchema,
+    RepositorySchema,
+    ChatMessageDocument,
+    IngestionRequestSchema,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +29,7 @@ class MongoDBService:
         self.repositories = mongodb.db["csRepositories"]
         self.chunks = mongodb.db["csChunks"]
         self.chat_sessions = mongodb.db["csChatSessions"]
+        self.ingestion_requests = mongodb.db["csIngestionRequests"]
 
     @staticmethod
     def _to_object_id(value: Union[str, ObjectId]) -> ObjectId:
@@ -121,10 +128,10 @@ class MongoDBService:
         """
         try:
             repo_object_id = self._to_object_id(repo_id)
-            
+
             # Get total count
             total = await self.chat_sessions.count_documents({"repo_id": repo_object_id})
-            
+
             # Fetch sessions with pagination
             cursor = (
                 self.chat_sessions.find(
@@ -144,10 +151,10 @@ class MongoDBService:
                 .limit(limit)
             )
             sessions = await cursor.to_list(length=limit)
-            
+
             for session in sessions:
                 session["repo_id"] = repo_id
-            
+
             return sessions, total
 
         except Exception as e:  # pylint: disable=broad-except
@@ -328,23 +335,23 @@ class MongoDBService:
         """
         try:
             repo_object_id = self._to_object_id(repo_id)
-            
+
             # Find the session to get messages
             session_doc = await self.chat_sessions.find_one(
                 {"repo_id": repo_object_id, "session_id": session_id},
                 {"messages": 1}
             )
-            
+
             if not session_doc:
                 logger.debug("Chat session not found: %s", session_id)
                 return [], 0
-            
+
             messages = session_doc.get("messages", [])
             total = len(messages)
-            
+
             # Apply pagination (messages are already in chronological order)
             paginated_messages = messages[skip : skip + limit]
-            
+
             logger.debug(
                 "Retrieved %d messages for session %s (skip: %d, limit: %d, total: %d)",
                 len(paginated_messages),
@@ -353,7 +360,7 @@ class MongoDBService:
                 limit,
                 total,
             )
-            
+
             return paginated_messages, total
 
         except Exception as e:  # pylint: disable=broad-except
@@ -513,7 +520,7 @@ class MongoDBService:
         try:
             repo_object_id = self._to_object_id(repo_id)
             result = await self.repositories.delete_one({"_id": repo_object_id})
-            
+
             if result.deleted_count > 0:
                 logger.info("Deleted repository: %s", repo_id)
                 return True
@@ -550,7 +557,7 @@ class MongoDBService:
             queries_collection = mongodb.db["csQueries"]
             repo_object_id = self._to_object_id(repo_id)
             result = await queries_collection.delete_many({"repo_id": repo_object_id})
-            
+
             logger.info(
                 "Deleted %d queries for repository: %s",
                 result.deleted_count,
@@ -580,14 +587,14 @@ class MongoDBService:
         try:
             repo_object_id = self._to_object_id(repo_id)
             repo_doc = await self.repositories.find_one({"_id": repo_object_id})
-            
+
             if not repo_doc:
                 logger.debug("Repository not found: %s", repo_id)
                 return None
-            
+
             repo_doc["id"] = str(repo_doc["_id"])
             repo_doc.pop("_id", None)
-            
+
             # Validate with schema
             try:
                 repo_schema = RepositorySchema(**{k: v for k, v in repo_doc.items() if k != "id"})
@@ -650,10 +657,10 @@ class MongoDBService:
                         {"repository_url": search_regex}
                     ]
                 }
-            
+
             # Get total count with search filter
             total = await self.repositories.count_documents(search_filter)
-            
+
             # Projection for lightweight summary fields (matching UI requirements)
             projection = {
                 "repo_name": 1,
@@ -723,24 +730,24 @@ class MongoDBService:
 
             # Get total chunks count
             total_chunks = await self.chunks.count_documents({"repo_id": repo_object_id})
-            
+
             # Get language distribution using find and manual counting
             # (more reliable than aggregate for async PyMongo)
             language_distribution = {}
             async for chunk in self.chunks.find({"repo_id": repo_object_id}, {"language": 1}):
                 language = chunk.get("language", "unknown")
                 language_distribution[language] = language_distribution.get(language, 0) + 1
-            
+
             # Get chunk type distribution from metadata.type
             chunk_type_distribution = {}
             async for chunk in self.chunks.find({"repo_id": repo_object_id}, {"metadata.type": 1}):
                 chunk_type = chunk.get("metadata", {}).get("type", "unknown")
                 chunk_type_distribution[chunk_type] = chunk_type_distribution.get(chunk_type, 0) + 1
-            
+
             # Get unique file count using distinct
             unique_files = await self.chunks.distinct("file_path", {"repo_id": repo_object_id})
             total_files = len(unique_files)
-            
+
             stats = {
                 "id": repo_id,
                 "repo_name": repo.get("repo_name", ""),
@@ -749,14 +756,14 @@ class MongoDBService:
                 "language_distribution": language_distribution,
                 "chunk_type_distribution": chunk_type_distribution
             }
-            
+
             logger.debug(
                 "Retrieved stats for repository %s: %d chunks, %d files",
                 repo_id,
                 total_chunks,
                 total_files
             )
-            
+
             return stats
 
         except PyMongoError as e:
@@ -775,3 +782,309 @@ class MongoDBService:
                 exc_info=True
             )
             return None
+
+    async def create_ingestion_request(self, repo_data: Dict) -> Optional[ObjectId]:
+        """
+        Create a new ingestion request document.
+
+        Args:
+            repo_data: Repository data dictionary with owner, repo_name, repository_url, branch
+
+        Returns:
+            Request ObjectId if successful, None otherwise
+        """
+        try:
+            request_schema = IngestionRequestSchema(**repo_data)
+            request_dict = request_schema.model_dump(by_alias=True, exclude={"id", "_id"})
+
+            # Remove _id if present (let MongoDB generate it)
+            request_dict.pop("_id", None)
+            request_dict.pop("id", None)
+
+            result = await self.ingestion_requests.insert_one(request_dict)
+            request_object_id = result.inserted_id
+
+            logger.info(
+                "Created ingestion request: %s (_id: %s)",
+                f"{repo_data.get('owner')}/{repo_data.get('repo_name')}",
+                str(request_object_id)
+            )
+
+            return request_object_id
+
+        except Exception as e:
+            logger.error("Failed to create ingestion request: %s", e, exc_info=True)
+            return None
+
+    async def get_ingestion_request(self, request_id: str) -> Optional[Dict]:
+        """
+        Get ingestion request by ObjectId.
+
+        Args:
+            request_id: Request identifier (MongoDB ObjectId as string)
+
+        Returns:
+            Ingestion request dictionary or None if not found
+        """
+        try:
+            request_object_id = self._to_object_id(request_id)
+            request_doc = await self.ingestion_requests.find_one({"_id": request_object_id})
+
+            if not request_doc:
+                logger.debug("Ingestion request not found: %s", request_id)
+                return None
+
+            request_doc["id"] = str(request_doc["_id"])
+            request_doc.pop("_id", None)
+
+            # Convert repo_id ObjectId to string if present
+            if "repo_id" in request_doc and request_doc["repo_id"]:
+                request_doc["repo_id"] = str(request_doc["repo_id"])
+
+            return request_doc
+
+        except ValueError:
+            logger.warning("Invalid ObjectId format: %s", request_id)
+            return None
+        except Exception as e:
+            logger.error(
+                "Failed to get ingestion request %s: %s",
+                request_id,
+                e,
+                exc_info=True
+            )
+            return None
+
+    async def update_ingestion_request_status(
+        self,
+        request_id: str,
+        status: str,
+        error: Optional[str] = None,
+        message: Optional[str] = None,
+        repo_id: Optional[str] = None
+    ) -> bool:
+        """
+        Update ingestion request status and related fields.
+
+        Args:
+            request_id: Request identifier
+            status: New status (pending, processing, completed, failed)
+            error: Optional error message
+            message: Optional status message
+            repo_id: Optional repository ObjectId to link
+
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            # Build update document
+            update_doc = {
+                "$set": {
+                    "status": status,
+                    "updated_at": datetime.now()
+                }
+            }
+
+            # Handle error field
+            if error is not None:
+                update_doc["$set"]["error"] = error
+            # Clear error when status changes to pending (for retry scenarios)
+            elif status == "pending":
+                if "$unset" not in update_doc:
+                    update_doc["$unset"] = {}
+                update_doc["$unset"]["error"] = ""
+            if message is not None:
+                update_doc["$set"]["message"] = message
+            if repo_id is not None:
+                update_doc["$set"]["repo_id"] = self._to_object_id(repo_id)
+
+            # Set started_at when status changes to processing (only if not already set)
+            if status == "processing":
+                # Use $setOnInsert to only set if field doesn't exist
+                if "$setOnInsert" not in update_doc:
+                    update_doc["$setOnInsert"] = {}
+                update_doc["$setOnInsert"]["started_at"] = datetime.now()
+
+            # Set completed_at when status changes to completed or failed
+            if status in ("completed", "failed"):
+                update_doc["$set"]["completed_at"] = datetime.now()
+
+            # Find request by ObjectId
+            try:
+                request_object_id = self._to_object_id(request_id)
+                filter_query = {"_id": request_object_id}
+            except ValueError as e:
+                logger.warning("Invalid ObjectId format for request_id %s: %s", request_id, e)
+                return False
+
+            result = await self.ingestion_requests.update_one(filter_query, update_doc)
+
+            if result.matched_count > 0:
+                logger.debug(
+                    "Updated ingestion request %s: status=%s",
+                    request_id,
+                    status
+                )
+                return True
+            else:
+                logger.warning("Ingestion request not found for update: %s", request_id)
+                return False
+
+        except Exception as e:
+            logger.error(
+                "Failed to update ingestion request status %s: %s",
+                request_id,
+                e,
+                exc_info=True
+            )
+            return False
+
+    async def check_retry_rate_limit(
+        self,
+        owner: str,
+        repo_name: str,
+        time_window_hours: int = 2,
+        max_retries: int = 3
+    ) -> Tuple[bool, int, Optional[datetime]]:
+        """
+        Check if retry is allowed based on rate limiting rules.
+
+        Args:
+            owner: Repository owner
+            repo_name: Repository name
+            time_window_hours: Time window in hours (default: 2)
+            max_retries: Maximum retries allowed in time window (default: 3)
+
+        Returns:
+            Tuple of (allowed: bool, current_retry_count: int, retry_after: Optional[datetime])
+        """
+        try:
+            from datetime import timedelta
+
+            time_window = datetime.now() - timedelta(hours=time_window_hours)
+
+            # Query failed requests or requests with retry_count > 0 in the time window
+            query = {
+                "owner": owner,
+                "repo_name": repo_name,
+                "$or": [
+                    {"status": "failed"},
+                    {"retry_count": {"$gt": 0}}
+                ],
+                "created_at": {"$gte": time_window}
+            }
+
+            cursor = self.ingestion_requests.find(query)
+            failed_requests = await cursor.to_list(length=None)
+
+            retry_count = len(failed_requests)
+
+            if retry_count >= max_retries:
+                # Find oldest failed request to calculate retry_after
+                if failed_requests:
+                    oldest_request = min(failed_requests, key=lambda x: x.get("created_at", datetime.now()))
+                    oldest_time = oldest_request.get("created_at", datetime.now())
+                    retry_after = oldest_time + timedelta(hours=time_window_hours)
+                    logger.warning(
+                        "Rate limit exceeded for %s/%s: %d retries in last %d hours. Retry after: %s",
+                        owner,
+                        repo_name,
+                        retry_count,
+                        time_window_hours,
+                        retry_after
+                    )
+                    return False, retry_count, retry_after
+
+            return True, retry_count, None
+
+        except Exception as e:
+            logger.error(
+                "Failed to check retry rate limit for %s/%s: %s",
+                owner,
+                repo_name,
+                e,
+                exc_info=True
+            )
+            # On error, allow retry (fail open)
+            return True, 0, None
+
+    async def get_active_ingestion_request(self, owner: str, repo_name: str) -> Optional[Dict]:
+        """
+        Get active (pending or processing) ingestion request for a repository.
+
+        Args:
+            owner: Repository owner
+            repo_name: Repository name
+
+        Returns:
+            Active ingestion request dictionary or None if not found
+        """
+        try:
+            request_doc = await self.ingestion_requests.find_one(
+                {
+                    "owner": owner,
+                    "repo_name": repo_name,
+                    "status": {"$in": ["pending", "processing"]}
+                },
+                sort=[("created_at", -1)]  # Get most recent active request
+            )
+
+            if not request_doc:
+                return None
+
+            request_doc["id"] = str(request_doc["_id"])
+            request_doc.pop("_id", None)
+
+            # Convert repo_id ObjectId to string if present
+            if "repo_id" in request_doc and request_doc["repo_id"]:
+                request_doc["repo_id"] = str(request_doc["repo_id"])
+
+            return request_doc
+
+        except Exception as e:
+            logger.error(
+                "Failed to get active ingestion request for %s/%s: %s",
+                owner,
+                repo_name,
+                e,
+                exc_info=True
+            )
+            return None
+
+    async def increment_retry_count(self, request_id: str) -> bool:
+        """
+        Increment retry count for an ingestion request.
+
+        Args:
+            request_id: Request identifier
+
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            # Find request by ObjectId
+            try:
+                request_object_id = self._to_object_id(request_id)
+                filter_query = {"_id": request_object_id}
+            except ValueError as e:
+                logger.warning("Invalid ObjectId format for request_id %s: %s", request_id, e)
+                return False
+
+            result = await self.ingestion_requests.update_one(
+                filter_query,
+                {
+                    "$inc": {"retry_count": 1},
+                    "$set": {"updated_at": datetime.now()}
+                }
+            )
+
+            return result.matched_count > 0
+
+        except Exception as e:
+            logger.error(
+                "Failed to increment retry count for request %s: %s",
+                request_id,
+                e,
+                exc_info=True
+            )
+            return False

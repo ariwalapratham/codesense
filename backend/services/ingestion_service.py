@@ -340,7 +340,7 @@ class IngestionService:
         files_processed: int,
         chunks_with_embeddings: int,
         parsing_stats: Optional[Dict]
-    ) -> bool:
+    ) -> Tuple[bool, Optional[ObjectId]]:
         """
         Store embeddings in vector store and metadata in MongoDB.
 
@@ -359,7 +359,7 @@ class IngestionService:
         Returns:
             True if successful, False otherwise
         """
-        
+
         try:
             # Store embeddings in FAISS (uses vector_store_id: owner_repo format)
             logger.info("Storing embeddings in FAISS for repository: %s", vector_store_id)
@@ -371,7 +371,7 @@ class IngestionService:
 
             if not faiss_success:
                 logger.error("Failed to store embeddings in FAISS for repository: %s", vector_store_id)
-                return False
+                return False, None
 
             # Prepare repository data (without repo_id)
             repo_data = self._prepare_repository_data(
@@ -391,7 +391,7 @@ class IngestionService:
             repo_object_id = await self.mongodb_service.upsert_repository(repo_data)
             if not repo_object_id:
                 logger.warning("Failed to upsert repository in MongoDB, continuing...")
-                return False
+                return False, None
 
             # Prepare chunks data with ObjectId
             chunks_data = self._prepare_chunks_data(
@@ -414,11 +414,11 @@ class IngestionService:
                 logger.warning("Failed to upsert some chunks in MongoDB, continuing...")
 
             logger.info("Stored %d chunks for repository %s", len(embedded_chunks), str(repo_object_id))
-            return True
+            return True, repo_object_id
 
         except (OSError, ValueError, KeyError) as e:
             logger.error("Failed to store embeddings: %s", e, exc_info=True)
-            return False
+            return False, None
 
     async def delete_repository(self, repo_id: str) -> Tuple[bool, str, Dict[str, bool]]:
         """
@@ -453,7 +453,7 @@ class IngestionService:
 
             owner = repo.get("owner")
             repo_name = repo.get("repo_name")
-            
+
             if not owner or not repo_name:
                 error_msg = f"Repository missing owner or repo_name: {repo_id}"
                 logger.error(error_msg)
@@ -489,7 +489,7 @@ class IngestionService:
 
             # Check overall success
             all_succeeded = all(details.values())
-            
+
             if all_succeeded:
                 success_msg = f"Successfully deleted repository {repo_id} and all associated data"
                 logger.info(success_msg)
@@ -533,7 +533,8 @@ class IngestionService:
         self,
         repo_url: str,
         branch: Optional[str] = None,
-        cleanup: bool = True
+        cleanup: bool = True,
+        request_id: Optional[str] = None
     ) -> Tuple[bool, str]:
         """
         Orchestrate the complete ingestion pipeline for a repository.
@@ -544,6 +545,7 @@ class IngestionService:
             repo_url: URL of the repository to ingest
             branch: Specific branch to clone (optional)
             cleanup: Whether to cleanup temporary repository after processing
+            request_id: Optional ingestion request ID for status tracking
 
         Returns:
             Tuple of (success: bool, message: str)
@@ -552,7 +554,15 @@ class IngestionService:
         parsing_stats: Optional[Dict] = None
 
         try:
-            logger.info("Starting ingestion pipeline for repository: %s", repo_url)
+            logger.info("Starting ingestion pipeline for repository: %s (request_id: %s)", repo_url, request_id)
+
+            # Update status to processing
+            if request_id:
+                await self.mongodb_service.update_ingestion_request_status(
+                    request_id=request_id,
+                    status="processing",
+                    message="Processing repository..."
+                )
 
             # Step 1: Extract repository information
             try:
@@ -562,6 +572,12 @@ class IngestionService:
             except ValueError as e:
                 error_msg = f"Failed to extract repository information: {e}"
                 logger.error("%s", error_msg)
+                if request_id:
+                    await self.mongodb_service.update_ingestion_request_status(
+                        request_id=request_id,
+                        status="failed",
+                        error=error_msg
+                    )
                 return False, error_msg
 
             # Step 2: Prepare temporary repository path (initially without commit hash)
@@ -583,6 +599,12 @@ class IngestionService:
             if not success:
                 error_msg = f"Failed to clone repository: {message}"
                 logger.error("%s", error_msg)
+                if request_id:
+                    await self.mongodb_service.update_ingestion_request_status(
+                        request_id=request_id,
+                        status="failed",
+                        error=error_msg
+                    )
                 return False, error_msg
 
             logger.info("Repository cloned successfully: %s", message)
@@ -613,17 +635,26 @@ class IngestionService:
                 owner=owner,
                 repo_name=repo_name
             )
-            
+
             if existing_repo and existing_repo.get("commit_hash") == commit_hash:
                 # Repository already ingested with same commit hash
                 if cleanup:
                     await self._cleanup_temp_repo(repo_path)
-                
+
                 success_msg = (
                     f"Repository {vector_store_id} with commit {commit_hash} "
                     f"has already been ingested."
                 )
                 logger.info(success_msg)
+
+                # Update status to completed if request_id exists
+                if request_id:
+                    await self.mongodb_service.update_ingestion_request_status(
+                        request_id=request_id,
+                        status="completed",
+                        message=success_msg
+                    )
+
                 return True, success_msg
 
             # Step 5: Discover code files
@@ -633,6 +664,12 @@ class IngestionService:
             if not code_files:
                 error_msg = "No code files found in repository"
                 logger.warning("%s", error_msg)
+                if request_id:
+                    await self.mongodb_service.update_ingestion_request_status(
+                        request_id=request_id,
+                        status="failed",
+                        error=error_msg
+                    )
                 if cleanup:
                     await self._cleanup_temp_repo(repo_path)
                 return False, error_msg
@@ -646,6 +683,12 @@ class IngestionService:
             if not parsed_structures:
                 error_msg = "Failed to parse any files"
                 logger.error(error_msg)
+                if request_id:
+                    await self.mongodb_service.update_ingestion_request_status(
+                        request_id=request_id,
+                        status="failed",
+                        error=error_msg
+                    )
                 if cleanup:
                     await self._cleanup_temp_repo(repo_path)
                 return False, error_msg
@@ -679,6 +722,12 @@ class IngestionService:
             if not embedded_chunks:
                 error_msg = "Failed to chunk code and generate embeddings"
                 logger.error(error_msg)
+                if request_id:
+                    await self.mongodb_service.update_ingestion_request_status(
+                        request_id=request_id,
+                        status="failed",
+                        error=error_msg
+                    )
                 if cleanup:
                     await self._cleanup_temp_repo(repo_path)
                 return False, error_msg
@@ -696,7 +745,7 @@ class IngestionService:
 
             # Step 9: Store embeddings and metadata
             logger.info("Storing embeddings and metadata...")
-            store_success = await self._store_embeddings(
+            store_success, repo_object_id = await self._store_embeddings(
                 embedded_chunks=embedded_chunks,
                 vector_store_id=vector_store_id,
                 owner=owner,
@@ -712,9 +761,23 @@ class IngestionService:
             if not store_success:
                 error_msg = "Failed to store embeddings"
                 logger.error(error_msg)
+                if request_id:
+                    await self.mongodb_service.update_ingestion_request_status(
+                        request_id=request_id,
+                        status="failed",
+                        error=error_msg
+                    )
                 if cleanup:
                     await self._cleanup_temp_repo(repo_path)
                 return False, error_msg
+
+            # Link repository ID to ingestion request
+            if request_id and repo_object_id:
+                await self.mongodb_service.update_ingestion_request_status(
+                    request_id=request_id,
+                    status="processing",
+                    repo_id=str(repo_object_id)
+                )
 
             # Step 10: Cleanup temporary repository
             if cleanup:
@@ -727,6 +790,14 @@ class IngestionService:
             )
             logger.info(success_msg)
 
+            # Update status to completed
+            if request_id:
+                await self.mongodb_service.update_ingestion_request_status(
+                    request_id=request_id,
+                    status="completed",
+                    message=success_msg
+                )
+
             return True, success_msg
 
         # Top-level orchestration method needs broad exception handling
@@ -734,6 +805,14 @@ class IngestionService:
         except (OSError, ValueError, KeyError, RuntimeError, AttributeError) as e:
             error_msg = f"Unexpected error during ingestion: {e}"
             logger.error(error_msg, exc_info=True)
+
+            # Update status to failed
+            if request_id:
+                await self.mongodb_service.update_ingestion_request_status(
+                    request_id=request_id,
+                    status="failed",
+                    error=error_msg
+                )
 
             # Cleanup on error
             if cleanup and repo_path:

@@ -1,6 +1,6 @@
 """Schema package exports."""
 
-from .ingestion import IngestionRequest, IngestionResponse
+from .ingestion import IngestionRequest, IngestionResponse, IngestionStatusResponse
 from .repository import (
     DeleteRepositoryResponse,
     ParsingStatsResponse,
@@ -25,6 +25,7 @@ __all__ = [
     # Ingestion
     "IngestionRequest",
     "IngestionResponse",
+    "IngestionStatusResponse",
     # Repository
     "DeleteRepositoryResponse",
     "ParsingStatsResponse",
