@@ -45,8 +45,8 @@ class ChatSessionSchema(BaseModel):
         le=100,
         description="Number of messages that have been summarized",
     )
-    created_at: datetime = Field(default_factory=datetime.now(), description="Creation timestamp")
-    updated_at: datetime = Field(default_factory=datetime.now(),
+    created_at: datetime = Field(default_factory=datetime.now, description="Creation timestamp")
+    updated_at: datetime = Field(default_factory=datetime.now,
         description="Last update timestamp")
     messages: List[ChatMessageDocument] = Field(default_factory=list,
         description="Embedded chat messages")
