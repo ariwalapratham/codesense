@@ -94,6 +94,7 @@ class RepositorySummary(BaseModel):
     id: str = Field(..., description="Unique repository identifier (MongoDB ObjectId as string)")
     repo_name: str = Field(..., description="Repository name")
     repository_url: str = Field(..., description="Full repository URL")
+    status: str = Field(default="pending", description="Repository ingestion status")
     files_processed: int = Field(..., description="Number of files processed")
     created_at: datetime = Field(..., description="First ingestion timestamp")
     updated_at: datetime = Field(..., description="Last update timestamp")

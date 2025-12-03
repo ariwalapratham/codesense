@@ -48,7 +48,7 @@ class IngestionService:
         self.mongodb_service = MongoDBService()
 
     @staticmethod
-    def _extract_repo_info(repo_url: str) -> Tuple[str, str, str]:
+    def _extract_repo_info(repo_url: str, branch: str) -> Tuple[str, str, str]:
         """
         Extract repository information from URL.
 
@@ -67,8 +67,8 @@ class IngestionService:
         else:
             raise ValueError(f"Invalid repository URL format: {repo_url}")
 
-        # Create sanitized vector_store_id: owner_repo (for FAISS vector store)
-        vector_store_id = f"{owner}_{repo_name}".lower()
+        # Create sanitized vector_store_id: owner_repo_branch (for FAISS vector store)
+        vector_store_id = f"{owner}_{repo_name}_{branch}".lower()
         vector_store_id = re.sub(r"[^a-z0-9_]", "_", vector_store_id)
 
         return owner, repo_name, vector_store_id
@@ -453,6 +453,7 @@ class IngestionService:
 
             owner = repo.get("owner")
             repo_name = repo.get("repo_name")
+            branch = repo.get("branch")
 
             if not owner or not repo_name:
                 error_msg = f"Repository missing owner or repo_name: {repo_id}"
@@ -460,10 +461,11 @@ class IngestionService:
                 return False, error_msg, details
 
             # Generate vector_store_id (same logic as ingestion)
-            vector_store_id = f"{owner}_{repo_name}".lower()
+            vector_store_id = f"{owner}_{repo_name}_{branch}".lower()
             vector_store_id = re.sub(r"[^a-z0-9_]", "_", vector_store_id)
 
-            logger.info("Starting deletion of repository: %s (vector_store_id: %s)", repo_id, vector_store_id)
+            logger.info("Starting deletion of repository: %s (vector_store_id: %s)",
+                repo_id, vector_store_id)
 
             # Step 1: Delete all chunks
             logger.info("Deleting chunks for repository: %s", repo_id)
@@ -554,7 +556,8 @@ class IngestionService:
         parsing_stats: Optional[Dict] = None
 
         try:
-            logger.info("Starting ingestion pipeline for repository: %s (request_id: %s)", repo_url, request_id)
+            logger.info("Starting ingestion pipeline for repository: %s (branch: %s, request_id: %s)",
+                repo_url, branch, request_id)
 
             # Update status to processing
             if request_id:
@@ -566,7 +569,7 @@ class IngestionService:
 
             # Step 1: Extract repository information
             try:
-                owner, repo_name, vector_store_id = self._extract_repo_info(repo_url)
+                owner, repo_name, vector_store_id = self._extract_repo_info(repo_url, branch)
                 logger.info("Repository info - Owner: %s, Name: %s, Vector Store ID: %s",
                     owner, repo_name, vector_store_id)
             except ValueError as e:
@@ -629,33 +632,6 @@ class IngestionService:
                         logger.info("Renamed temp repo path to: %s", repo_path)
                     except OSError as e:
                         logger.warning("Failed to rename temp repo path: %s", e)
-
-            # Step 4.5: Check if repository with same owner, repo_name, and commit_hash already exists
-            existing_repo = await self.mongodb_service.find_repository_by_owner_and_name(
-                owner=owner,
-                repo_name=repo_name
-            )
-
-            if existing_repo and existing_repo.get("commit_hash") == commit_hash:
-                # Repository already ingested with same commit hash
-                if cleanup:
-                    await self._cleanup_temp_repo(repo_path)
-
-                success_msg = (
-                    f"Repository {vector_store_id} with commit {commit_hash} "
-                    f"has already been ingested."
-                )
-                logger.info(success_msg)
-
-                # Update status to completed if request_id exists
-                if request_id:
-                    await self.mongodb_service.update_ingestion_request_status(
-                        request_id=request_id,
-                        status="completed",
-                        message=success_msg
-                    )
-
-                return True, success_msg
 
             # Step 5: Discover code files
             logger.info("Discovering code files...")

@@ -12,8 +12,9 @@ class IngestionRequest(BaseModel):
     """Request model for repository ingestion."""
 
     repo_url: HttpUrl = Field(..., description="URL of the repository to ingest")
-    branch: Optional[str] = Field(None, description="Specific branch to clone (optional)")
-    cleanup: bool = Field(True, description="Whether to cleanup temporary repository after processing")
+    branch: Optional[str] = Field("main", description="Specific branch to clone (optional)")
+    cleanup: bool = Field(True,
+    description="Whether to cleanup temporary repository after processing")
 
     model_config = ConfigDict(
         json_schema_extra={
@@ -29,22 +30,26 @@ class IngestionRequest(BaseModel):
 class IngestionResponse(BaseModel):
     """Response model for repository ingestion request creation."""
 
-    request_id: str = Field(..., description="Ingestion request ID")
-    repo_id: Optional[str] = Field(None, description="Repository ID (if created)")
+    request_id: Optional[str] = Field(None, description="Ingestion request ID")
+    repo_id: Optional[str] = Field(None, description="Repository ID (if linked)")
+    owner: str = Field(..., description="Repository owner")
+    repo_name: str = Field(..., description="Repository name")
+    branch: str = Field(..., description="Repository branch")
     status: IngestionStatus = Field(..., description="Initial status")
     message: str = Field(..., description="Status message")
 
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
-                "request_id": "req_abc123",
-                "repo_id": "507f1f77bcf86cd799439011",
+                "request_id": "6631c2f1e8a13b0b2fcd91aa",
+                "owner": "owner",
+                "repo_name": "repo",
+                "branch": "main",
                 "status": "pending",
-                "message": "Ingestion request created and queued for processing",
+                "message": "Ingestion request created and queued",
             }
         }
     )
-
 
 class IngestionStatusResponse(BaseModel):
     """Response model for ingestion status query."""

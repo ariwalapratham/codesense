@@ -1,7 +1,7 @@
 """MongoDB service for upserting repositories and chunks."""
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Union
 
 from bson import ObjectId
@@ -17,6 +17,8 @@ from schemas import (
     ChatMessageDocument,
     IngestionRequestSchema,
 )
+
+# pylint: disable=broad-exception-caught
 
 logger = logging.getLogger(__name__)
 
@@ -108,9 +110,39 @@ class MongoDBService:
 
             return repo_object_id
 
+
         except Exception as e:
             logger.error("Failed to upsert repository: %s", e, exc_info=True)
             return None
+
+    async def update_repository_status(
+        self, owner: str, repo_name: str, status: str
+    ) -> bool:
+        """
+        Update repository status.
+
+        Args:
+            owner: Repository owner
+            repo_name: Repository name
+            status: New status
+
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            result = await self.repositories.update_one(
+                {"owner": owner, "repo_name": repo_name},
+                {
+                    "$set": {
+                        "status": status,
+                        "updated_at": datetime.now()
+                    }
+                }
+            )
+            return result.matched_count > 0
+        except Exception as e:
+            logger.error("Failed to update repository status: %s", e, exc_info=True)
+            return False
 
     async def list_chat_sessions(
         self, repo_id: str, skip: int = 0, limit: int = 10
@@ -373,10 +405,11 @@ class MongoDBService:
             )
             return [], 0
 
-    async def find_repository_by_owner_and_name(
+    async def find_repository_by_identifier(
         self,
         owner: str,
-        repo_name: str
+        repo_name: str,
+        branch: Optional[str] = None
     ) -> Optional[Dict]:
         """
         Find a repository by owner and repo_name.
@@ -390,13 +423,13 @@ class MongoDBService:
         """
         try:
             repo_doc = await self.repositories.find_one(
-                {"owner": owner, "repo_name": repo_name}
+                {"owner": owner, "repo_name": repo_name, "branch": branch}
             )
             return repo_doc
 
         except Exception as e:
             logger.error(
-                "Failed to find repository by owner and name: %s",
+                "Failed to find repository by owner, name and branch: %s",
                 e,
                 exc_info=True
             )
@@ -665,6 +698,7 @@ class MongoDBService:
             projection = {
                 "repo_name": 1,
                 "repository_url": 1,
+                "status": 1,
                 "files_processed": 1,
                 "created_at": 1,
                 "updated_at": 1,
@@ -816,40 +850,94 @@ class MongoDBService:
             logger.error("Failed to create ingestion request: %s", e, exc_info=True)
             return None
 
-    async def get_ingestion_request(self, request_id: str) -> Optional[Dict]:
+    async def get_ingestion_request_by_repo_id(
+        self,
+        repo_id: str
+    ) -> Optional[Dict]:
         """
-        Get ingestion request by ObjectId.
+        Get the most recent ingestion request for a repository.
 
         Args:
-            request_id: Request identifier (MongoDB ObjectId as string)
+            repo_id: Repository identifier (MongoDB ObjectId as string)
 
         Returns:
             Ingestion request dictionary or None if not found
         """
         try:
-            request_object_id = self._to_object_id(request_id)
-            request_doc = await self.ingestion_requests.find_one({"_id": request_object_id})
+            repo_object_id = self._to_object_id(repo_id)
+
+            request_doc = await self.ingestion_requests.find_one(
+                {"repo_id": repo_object_id},
+                sort=[("created_at", -1)]  # Get most recent
+            )
 
             if not request_doc:
-                logger.debug("Ingestion request not found: %s", request_id)
                 return None
 
             request_doc["id"] = str(request_doc["_id"])
             request_doc.pop("_id", None)
 
-            # Convert repo_id ObjectId to string if present
             if "repo_id" in request_doc and request_doc["repo_id"]:
                 request_doc["repo_id"] = str(request_doc["repo_id"])
 
             return request_doc
 
-        except ValueError:
-            logger.warning("Invalid ObjectId format: %s", request_id)
-            return None
         except Exception as e:
             logger.error(
-                "Failed to get ingestion request %s: %s",
-                request_id,
+                "Failed to get ingestion request by repo_id %s: %s",
+                repo_id,
+                e,
+                exc_info=True
+            )
+            return None
+
+    async def get_ingestion_request_by_identifier(
+        self,
+        owner: str,
+        repo_name: str,
+        branch: Optional[str] = None
+    ) -> Optional[Dict]:
+        """
+        Get the most recent ingestion request by repository identifier.
+
+        Args:
+            owner: Repository owner
+            repo_name: Repository name
+            branch: Repository branch (optional)
+
+        Returns:
+            Ingestion request dictionary or None if not found
+        """
+        try:
+            query = {
+                "owner": owner,
+                "repo_name": repo_name
+            }
+
+            if branch:
+                query["branch"] = branch
+
+            request_doc = await self.ingestion_requests.find_one(
+                query,
+                sort=[("created_at", -1)]  # Get most recent
+            )
+
+            if not request_doc:
+                return None
+
+            request_doc["id"] = str(request_doc["_id"])
+            request_doc.pop("_id", None)
+
+            if "repo_id" in request_doc and request_doc["repo_id"]:
+                request_doc["repo_id"] = str(request_doc["repo_id"])
+
+            return request_doc
+
+        except Exception as e:
+            logger.error(
+                "Failed to get ingestion request by identifier %s/%s: %s",
+                owner,
+                repo_name,
                 e,
                 exc_info=True
             )
@@ -943,6 +1031,7 @@ class MongoDBService:
         self,
         owner: str,
         repo_name: str,
+        branch: Optional[str] = None,
         time_window_hours: int = 2,
         max_retries: int = 3
     ) -> Tuple[bool, int, Optional[datetime]]:
@@ -952,6 +1041,7 @@ class MongoDBService:
         Args:
             owner: Repository owner
             repo_name: Repository name
+            branch: Repository branch
             time_window_hours: Time window in hours (default: 2)
             max_retries: Maximum retries allowed in time window (default: 3)
 
@@ -959,7 +1049,6 @@ class MongoDBService:
             Tuple of (allowed: bool, current_retry_count: int, retry_after: Optional[datetime])
         """
         try:
-            from datetime import timedelta
 
             time_window = datetime.now() - timedelta(hours=time_window_hours)
 
@@ -974,6 +1063,9 @@ class MongoDBService:
                 "created_at": {"$gte": time_window}
             }
 
+            if branch:
+                query["branch"] = branch
+
             cursor = self.ingestion_requests.find(query)
             failed_requests = await cursor.to_list(length=None)
 
@@ -982,11 +1074,12 @@ class MongoDBService:
             if retry_count >= max_retries:
                 # Find oldest failed request to calculate retry_after
                 if failed_requests:
-                    oldest_request = min(failed_requests, key=lambda x: x.get("created_at", datetime.now()))
+                    oldest_request = min(
+                        failed_requests, key=lambda x: x.get("created_at", datetime.now()))
                     oldest_time = oldest_request.get("created_at", datetime.now())
                     retry_after = oldest_time + timedelta(hours=time_window_hours)
                     logger.warning(
-                        "Rate limit exceeded for %s/%s: %d retries in last %d hours. Retry after: %s",
+                    "Rate limit exceeded for %s/%s: %d retries in last %d hours. Retry after: %s",
                         owner,
                         repo_name,
                         retry_count,
@@ -1008,7 +1101,11 @@ class MongoDBService:
             # On error, allow retry (fail open)
             return True, 0, None
 
-    async def get_active_ingestion_request(self, owner: str, repo_name: str) -> Optional[Dict]:
+    async def get_active_ingestion_request(
+        self,
+        owner: str,
+        repo_name: str,
+        branch: Optional[str] = None) -> Optional[Dict]:
         """
         Get active (pending or processing) ingestion request for a repository.
 
@@ -1020,12 +1117,18 @@ class MongoDBService:
             Active ingestion request dictionary or None if not found
         """
         try:
+
+            query = {
+                "owner": owner,
+                "repo_name": repo_name,
+                "status": {"$in": ["pending", "processing"]}
+            }
+
+            if branch:
+                query["branch"] = branch
+
             request_doc = await self.ingestion_requests.find_one(
-                {
-                    "owner": owner,
-                    "repo_name": repo_name,
-                    "status": {"$in": ["pending", "processing"]}
-                },
+                query,
                 sort=[("created_at", -1)]  # Get most recent active request
             )
 

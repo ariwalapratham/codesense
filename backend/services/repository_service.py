@@ -3,8 +3,9 @@
 import re
 from pathlib import Path
 from typing import Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 
+import httpx
 from git import Repo, GitCommandError
 from git.exc import InvalidGitRepositoryError
 
@@ -241,3 +242,78 @@ class RepositoryService:
         except (InvalidGitRepositoryError, Exception):
             return None
 
+    @staticmethod
+    async def get_remote_commit_hash(
+        repo_url: str, branch: Optional[str] = None
+    ) -> Optional[str]:
+        """
+        Get the latest remote commit hash (short 7 characters) without cloning the repo.
+        Works for GitHub and GitLab repositories.
+
+        Args:
+            repo_url: Repository URL
+            branch: Branch name (optional)
+
+        Returns:
+            Short commit hash (7 characters) or None
+        """
+        repo_type = RepositoryService._detect_repository_type(repo_url)
+        token = RepositoryService._get_token_for_repo(repo_url)
+
+        parsed = urlparse(repo_url)
+        # Remove .git suffix and split into path components
+        path = parsed.path.strip("/").replace(".git", "")
+        parts = path.split("/")
+
+        if len(parts) < 2:
+            return None
+
+        owner, repo = parts[0], parts[1]
+
+        if repo_type == "github":
+            # GitHub API: GET /repos/{owner}/{repo}/commits?sha={branch}
+            api_url = f"https://api.github.com/repos/{owner}/{repo}/commits"
+            params = {}
+            if branch:
+                params["sha"] = branch
+            headers = {}
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+
+            async with httpx.AsyncClient() as client:
+                try:
+                    response = await client.get(api_url, headers=headers, params=params)
+                    if response.status_code != 200:
+                        return None
+                    data = response.json()
+                    # data can be a list of commits, latest first
+                    if isinstance(data, list) and len(data) > 0 and "sha" in data[0]:
+                        return data[0]["sha"][:7]
+                except Exception:
+                    return None
+
+        elif repo_type == "gitlab":
+            # GitLab API: GET /projects/:id/repository/commits?ref_name={branch}
+            # project_id must be urlquoted (owner/repo)
+            project_id = quote(f"{owner}/{repo}", safe="")
+            api_url = f"https://gitlab.com/api/v4/projects/{project_id}/repository/commits"
+            params = {}
+            if branch:
+                params["ref_name"] = branch
+            headers = {}
+            if token:
+                headers["PRIVATE-TOKEN"] = token
+
+            async with httpx.AsyncClient() as client:
+                try:
+                    response = await client.get(api_url, headers=headers, params=params)
+                    if response.status_code != 200:
+                        return None
+                    data = response.json()
+                    # data is a list of commits, latest first
+                    if isinstance(data, list) and len(data) > 0 and "id" in data[0]:
+                        return data[0]["id"][:7]
+                except Exception:
+                    return None
+
+        return None
