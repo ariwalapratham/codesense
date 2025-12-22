@@ -585,7 +585,6 @@ async def get_ingestion_status_by_request_id(
             detail=f"Failed to fetch ingestion status: {str(e)}"
         ) from e
 
-
 @router.get(
     "/ingest/status",
     response_model=IngestionStatusResponse,

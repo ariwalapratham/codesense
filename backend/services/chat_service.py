@@ -220,11 +220,18 @@ class ChatService:
 
     @staticmethod
     def _build_vector_store_id(repo_doc: Dict) -> str:
-        """Convert owner/repo_name combo into the FAISS identifier."""
+        """Convert owner/repo_name/branch combo into the FAISS identifier.
+        
+        Must match the format used in ingestion_service._extract_repo_info()
+        Format: owner_repo_branch (lowercase, sanitized)
+        """
         owner = repo_doc.get("owner", "")
         repo_name = repo_doc.get("repo_name", "")
-        vector_id = f"{owner}_{repo_name}".lower()
-        vector_id = re.sub(r"[^a-z0-9_]+", "_", vector_id)
+        branch = repo_doc.get("branch", "main")  # Default to "main" if not specified
+
+        # Match ingestion service format: owner_repo_branch
+        vector_id = f"{owner}_{repo_name}_{branch}".lower()
+        vector_id = re.sub(r"[^a-z0-9_]", "_", vector_id)
         vector_id = re.sub(r"_+", "_", vector_id).strip("_")
         return vector_id
 
