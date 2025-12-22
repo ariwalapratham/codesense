@@ -850,6 +850,44 @@ class MongoDBService:
             logger.error("Failed to create ingestion request: %s", e, exc_info=True)
             return None
 
+    async def get_ingestion_request(
+        self,
+        request_id: str
+    ) -> Optional[Dict]:
+        """
+        Get an ingestion request by its ID.
+
+        Args:
+            request_id: Ingestion request identifier (MongoDB ObjectId as string)
+
+        Returns:
+            Ingestion request dictionary or None if not found
+        """
+        try:
+            request_object_id = self._to_object_id(request_id)
+
+            request_doc = await self.ingestion_requests.find_one(
+                {"_id": request_object_id}
+            )
+
+            if not request_doc:
+                return None
+
+            request_doc["id"] = str(request_doc["_id"])
+            request_doc.pop("_id", None)
+
+            if "repo_id" in request_doc and request_doc["repo_id"]:
+                request_doc["repo_id"] = str(request_doc["repo_id"])
+
+            return request_doc
+
+        except Exception as e:
+            logger.error(
+                "Failed to get ingestion request %s: %s",
+                request_id, e, exc_info=True
+            )
+            return None
+
     async def get_ingestion_request_by_repo_id(
         self,
         repo_id: str
@@ -981,17 +1019,19 @@ class MongoDBService:
                 if "$unset" not in update_doc:
                     update_doc["$unset"] = {}
                 update_doc["$unset"]["error"] = ""
+                # Clear completed_at and started_at on retry to track new attempt
+                update_doc["$unset"]["completed_at"] = ""
+                update_doc["$unset"]["started_at"] = ""
             if message is not None:
                 update_doc["$set"]["message"] = message
             if repo_id is not None:
                 update_doc["$set"]["repo_id"] = self._to_object_id(repo_id)
 
-            # Set started_at when status changes to processing (only if not already set)
+            # Set started_at when status changes to processing
+            # If started_at was cleared (retry scenario), set it again
             if status == "processing":
-                # Use $setOnInsert to only set if field doesn't exist
-                if "$setOnInsert" not in update_doc:
-                    update_doc["$setOnInsert"] = {}
-                update_doc["$setOnInsert"]["started_at"] = datetime.now()
+                # Always set started_at when processing starts (handles both new and retry scenarios)
+                update_doc["$set"]["started_at"] = datetime.now()
 
             # Set completed_at when status changes to completed or failed
             if status in ("completed", "failed"):

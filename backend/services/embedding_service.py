@@ -17,6 +17,7 @@ except ImportError:
     GEMINI_AVAILABLE = False
 
 from config.settings import settings
+from utils.rate_limit_tracker import RateLimitTracker
 
 # Setup logger
 logger = logging.getLogger(__name__)
@@ -61,6 +62,28 @@ class EmbeddingService:
         # Token limit for semantic chunks (if exceeded, use recursive splitter)
         # ~800 tokens = ~3200 characters
         self.max_semantic_chunk_size = 3200
+
+        # Initialize rate limit tracker (free tier limits)
+        self.rate_limit_tracker = RateLimitTracker(
+            rpm_limit=100,      # 100 requests/minute
+            tpm_limit=30000,    # 30,000 tokens/minute
+            rpd_limit=1000      # 1,000 requests/day
+        )
+
+        # Reduced batch size for free tier (was 10, now 5)
+        # This helps stay under RPM limits: 100 RPM / 5 per batch = 20 batches/min max
+        self.default_batch_size = 5
+
+        # Delay between batches (in seconds)
+        # With 5 per batch and 100 RPM limit: 60s / (100/5) = 3s between batches
+        # Using 0.6s delay (conservative)
+        self.batch_delay = 0.6
+
+        # Exponential backoff settings for 429 errors
+        # Rate limits are per minute, so start with 60 seconds minimum
+        self.max_retries = 5
+        self.initial_backoff = 60.0  # Start with 60 seconds (1 minute) for rate limits
+        self.max_backoff = 180.0     # Max 3 minutes
 
     def _estimate_tokens(self, text: str) -> int:
         """
@@ -380,7 +403,7 @@ class EmbeddingService:
         logger.info("Created %d code chunks using hybrid strategy", len(chunks))
         return chunks
 
-    async def generate_embeddings(self, chunks: List[Dict], batch_size: int = 10) -> List[Dict]:
+    async def generate_embeddings(self, chunks: List[Dict], batch_size: Optional[int] = None) -> List[Dict]:
         """
         Generate embeddings for code chunks using Gemini.
 
@@ -394,6 +417,10 @@ class EmbeddingService:
         if not self.gemini_available:
             logger.warning("Gemini not available. Skipping embedding generation.")
             return chunks
+
+        # Use default batch size if not specified
+        if batch_size is None:
+            batch_size = self.default_batch_size
 
         embedded_chunks = []
         total_chunks = len(chunks)
@@ -456,6 +483,10 @@ class EmbeddingService:
                 total_chunks,
             )
 
+            # Add delay between batches (except for last batch)
+            if i + batch_size < total_chunks:
+                await asyncio.sleep(self.batch_delay)
+
         successful = sum(1 for chunk in embedded_chunks if chunk.get("embedding") is not None)
         logger.info(
             "Generated embeddings for %d/%d chunks successfully",
@@ -464,7 +495,7 @@ class EmbeddingService:
 
         return embedded_chunks
 
-    async def chunk_and_embed(self, parsed_structures: List[Dict], batch_size: int = 10) -> List[Dict]:
+    async def chunk_and_embed(self, parsed_structures: List[Dict], batch_size: Optional[int] = None) -> List[Dict]:
         """
         Convenience method to chunk code and generate embeddings in one call.
 
@@ -498,7 +529,7 @@ class EmbeddingService:
         self,
         texts: Sequence[str],
         allow_empty: bool = False,
-        batch_size: int = 10,
+        batch_size: Optional[int] = None,
     ) -> List[List[float]]:
         """
         Generate embeddings for a list of arbitrary texts.
@@ -506,7 +537,7 @@ class EmbeddingService:
         Args:
             texts: Sequence of strings to embed.
             allow_empty: If False, raise when service unavailable; if True return [].
-            batch_size: Number of texts per Gemini request.
+            batch_size: Number of texts per Gemini request. Uses default if None.
         """
         if not texts:
             return []
@@ -515,15 +546,93 @@ class EmbeddingService:
                 return [[] for _ in texts]
             raise RuntimeError("Gemini embedding service is not configured.")
 
+        # Use default batch size if not specified
+        if batch_size is None:
+            batch_size = self.default_batch_size
+
         embeddings: List[List[float]] = []
+        total_batches = (len(texts) + batch_size - 1) // batch_size
+
         for i in range(0, len(texts), batch_size):
             batch = list(texts[i : i + batch_size])
-            batch_embeddings = await self._embed_text_batch(batch)
-            embeddings.extend(batch_embeddings)
+            batch_num = (i // batch_size) + 1
+
+            logger.debug(
+                "Processing embedding batch %d/%d (%d texts)",
+                batch_num, total_batches, len(batch)
+            )
+
+            try:
+                batch_embeddings = await self._embed_text_batch_with_retry(batch)
+                embeddings.extend(batch_embeddings)
+
+                # Add delay between batches (except for last batch)
+                if i + batch_size < len(texts):
+                    await asyncio.sleep(self.batch_delay)
+
+            except RuntimeError as e:
+                # Daily quota exhausted or other critical error
+                if "quota exhausted" in str(e).lower():
+                    logger.error("Daily quota exhausted. Stopping embedding generation.")
+                    # Fill remaining with empty embeddings
+                    remaining = len(texts) - len(embeddings)
+                    embeddings.extend([[] for _ in range(remaining)])
+                    break
+                raise
+
         return embeddings
 
-    async def _embed_text_batch(self, texts: List[str]) -> List[List[float]]:
-        """Internal helper that calls Gemini to embed a batch of texts."""
+    async def _wait_for_rate_limit(self, estimated_tokens: int) -> bool:
+        """
+        Wait if necessary to respect rate limits.
+
+        Args:
+            estimated_tokens: Estimated token count for the request
+
+        Returns:
+            True if we can proceed, False if daily quota exhausted
+        """
+        _, wait_time = await self.rate_limit_tracker.can_make_request(estimated_tokens)
+
+        if wait_time is None:
+            return True
+
+        if wait_time > 3600:  # More than 1 hour wait (likely daily quota)
+            logger.error(
+                "Daily quota exhausted. Cannot proceed. Wait time: %.1f seconds (%.1f hours)",
+                wait_time, wait_time / 3600
+            )
+            return False
+
+        logger.info("Rate limit: waiting %.2f seconds before next request", wait_time)
+        await asyncio.sleep(wait_time)
+        return True
+
+    async def _embed_text_batch_with_retry(
+        self,
+        texts: List[str],
+        retry_count: int = 0
+    ) -> List[List[float]]:
+        """
+        Embed a batch of texts with exponential backoff retry logic.
+
+        Args:
+            texts: List of texts to embed
+            retry_count: Current retry attempt count
+
+        Returns:
+            List of embeddings
+        """
+        estimated_tokens = sum(self._estimate_tokens(text) for text in texts)
+
+        # Check rate limits before making request
+        can_proceed = await self._wait_for_rate_limit(estimated_tokens)
+        if not can_proceed:
+            raise RuntimeError(
+                "Daily quota exhausted. Cannot generate embeddings. "
+                "Please wait or upgrade to paid tier."
+            )
+
         loop = asyncio.get_running_loop()
 
         def _embed_sync(batch_texts: List[str]) -> List[List[float]]:
@@ -540,4 +649,56 @@ class EmbeddingService:
                     results.append([])
             return results
 
-        return await loop.run_in_executor(None, _embed_sync, texts)
+        try:
+            result = await loop.run_in_executor(None, _embed_sync, texts)
+            # Record successful request
+            await self.rate_limit_tracker.record_request(estimated_tokens)
+            return result
+
+        except Exception as e:
+            error_str = str(e).lower()
+
+            # Check if it's a rate limit error (429)
+            is_rate_limit = (
+                "429" in error_str or
+                "rate limit" in error_str or
+                "rate_limit" in error_str or
+                "quota exceeded" in error_str or
+                "resource exhausted" in error_str or
+                "too many requests" in error_str
+            )
+
+            if is_rate_limit and retry_count < self.max_retries:
+                # Check rate limit tracker to see how long we need to wait
+                _, wait_time = await self.rate_limit_tracker.can_make_request(estimated_tokens)
+                
+                # Use rate limit tracker's wait time if available, otherwise use exponential backoff
+                if wait_time is not None and wait_time > 0:
+                    backoff_time = max(wait_time, self.initial_backoff)  # At least 60 seconds
+                else:
+                    # Exponential backoff: 60s, 120s, 240s, 480s, 960s (capped at max_backoff)
+                    backoff_time = min(
+                        self.initial_backoff * (2 ** retry_count),
+                        self.max_backoff
+                    )
+
+                logger.warning(
+                    "Rate limit error (attempt %d/%d): %s. Waiting %.1f seconds (%.1f minutes) before retry...",
+                    retry_count + 1, self.max_retries, e, backoff_time, backoff_time / 60
+                )
+
+                await asyncio.sleep(backoff_time)
+
+                # Retry with increased count
+                return await self._embed_text_batch_with_retry(texts, retry_count + 1)
+            else:
+                # Not a rate limit error, or max retries exceeded
+                logger.error(
+                    "Failed to generate embeddings: %s (retry_count: %d)",
+                    e, retry_count, exc_info=True
+                )
+                raise
+
+    async def _embed_text_batch(self, texts: List[str]) -> List[List[float]]:
+        """Internal helper that calls Gemini to embed a batch of texts."""
+        return await self._embed_text_batch_with_retry(texts)

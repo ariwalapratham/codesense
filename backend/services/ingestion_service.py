@@ -690,10 +690,29 @@ class IngestionService:
 
             # Step 7: Chunk code and generate embeddings
             logger.info("Chunking code and generating embeddings...")
-            embedded_chunks = await self.embedding_service.chunk_and_embed(
-                parsed_structures,
-                batch_size=10  # Process 10 chunks at a time for embeddings
-            )
+            try:
+                embedded_chunks = await self.embedding_service.chunk_and_embed(
+                    parsed_structures,
+                    batch_size=None  # Use service's default (rate-limited) batch size
+                )
+            except RuntimeError as e:
+                if "quota exhausted" in str(e).lower():
+                    error_msg = (
+                        "Daily embedding quota exhausted. "
+                        "Please wait 24 hours or upgrade to paid tier. "
+                        f"Error: {e}"
+                    )
+                    logger.error(error_msg)
+                    if request_id:
+                        await self.mongodb_service.update_ingestion_request_status(
+                            request_id=request_id,
+                            status="failed",
+                            error=error_msg
+                        )
+                    if cleanup:
+                        await self._cleanup_temp_repo(repo_path)
+                    return False, error_msg
+                raise
 
             if not embedded_chunks:
                 error_msg = "Failed to chunk code and generate embeddings"

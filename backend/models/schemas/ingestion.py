@@ -35,6 +35,7 @@ class IngestionResponse(BaseModel):
     owner: str = Field(..., description="Repository owner")
     repo_name: str = Field(..., description="Repository name")
     branch: str = Field(..., description="Repository branch")
+    commit_hash: Optional[str] = Field(None, description="Repository commit hash")
     status: IngestionStatus = Field(..., description="Initial status")
     message: str = Field(..., description="Status message")
 
@@ -56,6 +57,10 @@ class IngestionStatusResponse(BaseModel):
 
     request_id: str = Field(..., description="Ingestion request ID")
     repo_id: Optional[str] = Field(None, description="Repository ID (if linked)")
+    owner: Optional[str] = Field(None, description="Repository owner")
+    repo_name: Optional[str] = Field(None, description="Repository name")
+    branch: Optional[str] = Field(None, description="Repository branch")
+    commit_hash: Optional[str] = Field(None, description="Repository commit hash")
     status: IngestionStatus = Field(..., description="Current request status")
     error: Optional[str] = Field(None, description="Error message if failed")
     retry_count: int = Field(..., description="Number of retry attempts")
@@ -72,6 +77,9 @@ class IngestionStatusResponse(BaseModel):
             "example": {
                 "request_id": "req_abc123",
                 "repo_id": "507f1f77bcf86cd799439011",
+                "owner": "owner",
+                "repo_name": "repo",
+                "branch": "main",
                 "status": "processing",
                 "error": None,
                 "retry_count": 0,

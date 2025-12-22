@@ -388,30 +388,41 @@ async def ingest_repository(
             active_status = active_request.get("status")
             active_request_id = active_request.get("id")
 
-            # Only block if actively processing
-            if active_status == IngestionStatus.PROCESSING:
+            # Block if actively processing OR pending (to prevent duplicate tasks)
+            if active_status in [IngestionStatus.PROCESSING, IngestionStatus.PENDING]:
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
                     detail={
-                        "error": "Repository is currently being processed",
+                        "error": "Repository ingestion already in progress",
                         "request_id": active_request_id,
                         "repo_id": active_request.get("repo_id"),
+                        "status": active_status,
                         "message": (
-                            f"Repository {owner}/{repo_name} "
-                            f"({branch}) is already being processed."
+                            f"Repository {owner}/{repo_name} ({branch}) "
+                            f"is already being processed (status: {active_status}). "
+                            f"Use request_id {active_request_id} to check status."
                         )
                     }
                 )
 
-            # If pending/failed, we can reuse the existing request
-            # (will be updated to processing below)
-            request_id = active_request_id
-            repo_id = active_request.get("repo_id")
-
-            logger.info(
-                "Reusing existing ingestion request %s with status %s",
-                request_id, active_status
-            )
+            # Only reuse if status is FAILED (allow retry)
+            if active_status == IngestionStatus.FAILED:
+                request_id = active_request_id
+                repo_id = active_request.get("repo_id")
+                logger.info(
+                    "Reusing failed ingestion request %s for retry",
+                    request_id
+                )
+            else:
+                # Should not reach here, but handle gracefully
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={
+                        "error": "Unexpected active request status",
+                        "request_id": active_request_id,
+                        "status": active_status
+                    }
+                )
         else:
             # Rate limit check (only for new requests)
             allowed, retry_count, retry_after = await mongodb_service.check_retry_rate_limit(
@@ -500,12 +511,89 @@ async def ingest_repository(
         ) from exc
 
 @router.get(
+    "/ingest/status/{request_id}",
+    response_model=IngestionStatusResponse,
+    summary="Get ingestion status by request ID",
+    description="Get the status of an ingestion request using the request_id returned from the ingest endpoint.",
+)
+async def get_ingestion_status_by_request_id(
+    request_id: str,
+) -> IngestionStatusResponse:
+    """
+    Get ingestion status by request ID.
+
+    This is the primary way to check ingestion status. The request_id
+    is returned from the POST /repository/ingest endpoint.
+
+    Args:
+        request_id: Ingestion request ID (returned from ingest endpoint)
+
+    Returns:
+        IngestionStatusResponse with current status
+
+    Raises:
+        HTTPException: If request not found
+    """
+    try:
+        # Get ingestion request by ID
+        ingestion_request = await mongodb_service.get_ingestion_request(request_id)
+
+        if not ingestion_request:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Ingestion request not found: {request_id}"
+            )
+
+        # Extract data
+        repo_id = ingestion_request.get("repo_id")
+        if repo_id:
+            repo_id = str(repo_id)
+
+        # Get commit hash from repository if available
+        commit_hash = None
+        if repo_id:
+            repo = await mongodb_service.get_repository(repo_id)
+            if repo:
+                commit_hash = repo.get("commit_hash")
+
+        return IngestionStatusResponse(
+            request_id=str(ingestion_request.get("id")),
+            repo_id=repo_id,
+            owner=ingestion_request.get("owner"),
+            repo_name=ingestion_request.get("repo_name"),
+            branch=ingestion_request.get("branch"),
+            commit_hash=commit_hash,
+            status=ingestion_request.get("status"),
+            error=ingestion_request.get("error"),
+            retry_count=ingestion_request.get("retry_count", 0),
+            retry_after=ingestion_request.get("retry_after"),
+            message=ingestion_request.get("message") or "Ingestion in progress",
+            created_at=ingestion_request.get("created_at"),
+            started_at=ingestion_request.get("started_at"),
+            completed_at=ingestion_request.get("completed_at")
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(
+            "Error fetching ingestion status for request %s: %s",
+            request_id, e, exc_info=True
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch ingestion status: {str(e)}"
+        ) from e
+
+
+@router.get(
     "/ingest/status",
     response_model=IngestionStatusResponse,
-    summary="Get repository ingestion status",
-    description="Get ingestion status by repository owner, name, and branch (for polling without repo_id)."
+    summary="[LEGACY] Get repository ingestion status",
+    description="[LEGACY] Get ingestion status by repository owner, name, and branch. Use GET /repository/ingest/status/{request_id} instead.",
+    deprecated=True,
 )
-async def get_repository_status(
+async def get_repository_status_legacy(
     owner: str = Query(..., description="Repository owner"),
     repo_name: str = Query(..., description="Repository name"),
     branch: str = Query("main", description="Repository branch"),
@@ -545,29 +633,23 @@ async def get_repository_status(
 
             if not ingestion_request:
                 # Repository exists but no request found (legacy or manual entry)
-                return IngestionStatusResponse(
-                    request_id=None,
-                    repo_id=repo_id,
-                    owner=owner,
-                    repo_name=repo_name,
-                    branch=branch,
-                    status=repo_status,
-                    error=None,
-                    retry_count=0,
-                    retry_after=None,
-                    message=f"Repository status: {repo_status}",
-                    created_at=repo.get("created_at"),
-                    started_at=None,
-                    completed_at=repo.get("last_ingested_at")
+                # For legacy endpoint, we need a request_id, so return error
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=(
+                        f"Repository {owner}/{repo_name} ({branch}) exists but has no ingestion request. "
+                        "Use GET /repository/{repo_id} to get repository details."
+                    )
                 )
 
             # Return combined data from repo and request
             return IngestionStatusResponse(
-                request_id=ingestion_request.get("id"),
+                request_id=str(ingestion_request.get("id")),
                 repo_id=repo_id,
                 owner=owner,
                 repo_name=repo_name,
                 branch=branch,
+                commit_hash=repo.get("commit_hash"),
                 status=repo_status,  # Use repo status as source of truth
                 error=ingestion_request.get("error"),
                 retry_count=ingestion_request.get("retry_count", 0),
@@ -592,12 +674,22 @@ async def get_repository_status(
             )
 
         # Return request status (pending/processing, no repo yet)
+        repo_id = ingestion_request.get("repo_id")
+        if repo_id:
+            repo_id = str(repo_id)
+            # Try to get commit hash from repo if it exists
+            repo = await mongodb_service.get_repository(repo_id)
+            commit_hash = repo.get("commit_hash") if repo else None
+        else:
+            commit_hash = None
+
         return IngestionStatusResponse(
-            request_id=ingestion_request.get("id"),
-            repo_id=ingestion_request.get("repo_id"),
+            request_id=str(ingestion_request.get("id")),
+            repo_id=repo_id,
             owner=owner,
             repo_name=repo_name,
             branch=branch,
+            commit_hash=commit_hash,
             status=ingestion_request.get("status"),
             error=ingestion_request.get("error"),
             retry_count=ingestion_request.get("retry_count", 0),
@@ -623,126 +715,153 @@ async def get_repository_status(
             detail=f"Failed to fetch repository status: {str(e)}"
         ) from e
 
+@router.post(
+    "/ingest/{request_id}/retry",
+    response_model=IngestionResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Retry failed ingestion",
+    description="Retry a failed ingestion request. Only works if status is 'failed', not 'completed' or 'processing'.",
+)
+async def retry_ingestion(
+    request_id: str,
+    background_tasks: BackgroundTasks
+) -> IngestionResponse:
+    """
+    Retry a failed ingestion request.
 
-# @router.post(
-#     "/ingest/{request_id}/retry",
-#     response_model=IngestionResponse,
-#     status_code=status.HTTP_202_ACCEPTED,
-#     summary="Retry failed ingestion",
-#     description="Retry a failed ingestion request. Only works if status is 'failed', not 'completed' or 'processing'."
-# )
-# async def retry_ingestion(
-#     request_id: str,
-#     background_tasks: BackgroundTasks
-# ) -> IngestionResponse:
-#     """
-#     Retry a failed ingestion request.
+    Args:
+        request_id: Ingestion request identifier
+        background_tasks: FastAPI background tasks for async processing
 
-#     Args:
-#         request_id: Ingestion request identifier
-#         background_tasks: FastAPI background tasks for async processing
+    Returns:
+        IngestionResponse with updated request_id and status
 
-#     Returns:
-#         IngestionResponse with updated request_id and status
+    Raises:
+        HTTPException: If request not found, not failed, or rate limit exceeded
+    """
+    try:
+        # Get the ingestion request
+        ingestion_request = await mongodb_service.get_ingestion_request(request_id)
 
-#     Raises:
-#         HTTPException: If request not found, not failed, or rate limit exceeded
-#     """
-#     try:
-#         # Get the ingestion request
-#         ingestion_request = await mongodb_service.get_ingestion_request(request_id)
+        if not ingestion_request:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Ingestion request not found: {request_id}"
+            )
 
-#         if not ingestion_request:
-#             raise HTTPException(
-#                 status_code=status.HTTP_404_NOT_FOUND,
-#                 detail=f"Ingestion request not found: {request_id}"
-#             )
+        current_status = ingestion_request.get("status")
 
-#         current_status = ingestion_request.get("status")
+        # Only allow retry if status is "failed"
+        # Use explicit string comparison since MongoDB returns strings
+        if current_status == IngestionStatus.COMPLETED.value or current_status == "completed":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cannot retry a completed ingestion request"
+            )
 
-#         # Only allow retry if status is "failed"
-#         if current_status == "completed":
-#             raise HTTPException(
-#                 status_code=status.HTTP_400_BAD_REQUEST,
-#                 detail="Cannot retry a completed ingestion request"
-#             )
+        if current_status == IngestionStatus.PROCESSING.value or current_status == "processing":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cannot retry an ingestion request that is currently processing"
+            )
 
-#         if current_status == "processing":
-#             raise HTTPException(
-#                 status_code=status.HTTP_400_BAD_REQUEST,
-#                 detail="Cannot retry an ingestion request that is currently processing"
-#             )
+        if current_status == IngestionStatus.PENDING.value or current_status == "pending":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cannot retry an ingestion request that is pending. It will be processed automatically."
+            )
 
-#         if current_status != "failed":
-#             raise HTTPException(
-#                 status_code=status.HTTP_400_BAD_REQUEST,
-#                 detail=f"Cannot retry ingestion request with status: {current_status}"
-#             )
+        if current_status != IngestionStatus.FAILED.value and current_status != "failed":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Cannot retry ingestion request with status: {current_status}"
+            )
 
-#         # Extract repository information for rate limiting check
-#         owner = ingestion_request.get("owner")
-#         repo_name = ingestion_request.get("repo_name")
-#         repo_url = ingestion_request.get("repository_url")
-#         branch = ingestion_request.get("branch")
+        # Extract repository information for rate limiting check
+        owner = ingestion_request.get("owner")
+        repo_name = ingestion_request.get("repo_name")
+        repo_url = ingestion_request.get("repository_url")
+        branch = ingestion_request.get("branch")
 
-#         if not owner or not repo_name or not repo_url:
-#             raise HTTPException(
-#                 status_code=status.HTTP_400_BAD_REQUEST,
-#                 detail="Ingestion request missing required repository information"
-#             )
+        if not owner or not repo_name or not repo_url:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Ingestion request missing required repository information"
+            )
 
-#         # Check retry rate limit
-#         allowed, retry_count, retry_after = await mongodb_service.check_retry_rate_limit(
-#             owner=owner,
-#             repo_name=repo_name,
-#             time_window_hours=2,
-#             max_retries=3
-#         )
+        # Check retry rate limit
+        allowed, retry_count, retry_after = await mongodb_service.check_retry_rate_limit(
+            owner=owner,
+            repo_name=repo_name,
+            branch=branch,
+            time_window_hours=2,
+            max_retries=3
+        )
 
-#         if not allowed:
-#             raise HTTPException(
-#                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-#                 detail={
-#                     "error": "Rate limit exceeded",
-#                     "message": f"Maximum 3 retries allowed within 2 hours. Current retry count: {retry_count}",
-#                     "retry_count": retry_count,
-#                     "retry_after": retry_after.isoformat() if retry_after else None
-#                 }
-#             )
+        if not allowed:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail={
+                    "error": "Rate limit exceeded",
+                    "message": (
+                        f"Maximum 3 retries allowed within 2 hours. "
+                        f"Current retry count: {retry_count}"
+                    ),
+                    "retry_count": retry_count,
+                    "retry_after": retry_after.isoformat() if retry_after else None
+                }
+            )
 
-#         # Increment retry count
-#         await mongodb_service.increment_retry_count(request_id)
+        # Increment retry count
+        await mongodb_service.increment_retry_count(request_id)
 
-#         # Reset status to pending (error will be cleared automatically)
-#         await mongodb_service.update_ingestion_request_status(
-#             request_id=request_id,
-#             status="pending",
-#             message="Retrying ingestion..."
-#         )
+        # Reset status to pending and clear error
+        await mongodb_service.update_ingestion_request_status(
+            request_id=request_id,
+            status=IngestionStatus.PENDING.value,
+            error=None,  # Clear previous error
+            message="Retrying ingestion..."
+        )
 
-#         # Add background task for ingestion
-#         background_tasks.add_task(
-#             ingestion_service.ingest_repository,
-#             repo_url=repo_url,
-#             branch=branch,
-#             cleanup=True,  # Default cleanup
-#             request_id=request_id
-#         )
+        # Add background task for ingestion
+        background_tasks.add_task(
+            ingestion_service.ingest_repository,
+            repo_url=repo_url,
+            branch=branch,
+            cleanup=True,  # Default cleanup
+            request_id=request_id
+        )
 
-#         logger.info("Retrying ingestion request: %s for repository: %s", request_id, repo_url)
+        logger.info("Retrying ingestion request: %s for repository: %s", request_id, repo_url)
 
-#         return IngestionResponse(
-#             request_id=request_id,
-#             repo_id=ingestion_request.get("repo_id"),
-#             status=IngestionStatus.PENDING,
-#             message="Ingestion retry initiated"
-#         )
+        # Get repo_id if available
+        repo_id = ingestion_request.get("repo_id")
+        if repo_id:
+            repo_id = str(repo_id)
 
-#     except HTTPException:
-#         raise
-#     except Exception as e:
-#         logger.error("Error retrying ingestion for %s: %s", request_id, e, exc_info=True)
-#         raise HTTPException(
-#             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-#             detail=f"Failed to retry ingestion: {str(e)}"
-#         ) from e
+        # Get commit hash if repo exists
+        commit_hash = None
+        if repo_id:
+            repo = await mongodb_service.get_repository(repo_id)
+            if repo:
+                commit_hash = repo.get("commit_hash")
+
+        return IngestionResponse(
+            request_id=request_id,
+            repo_id=repo_id,
+            owner=owner,
+            repo_name=repo_name,
+            branch=branch or "main",
+            commit_hash=commit_hash,
+            status=IngestionStatus.PENDING,
+            message="Ingestion retry initiated"
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Error retrying ingestion for %s: %s", request_id, e, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retry ingestion: {str(e)}"
+        ) from e
