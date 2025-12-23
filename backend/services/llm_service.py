@@ -2,7 +2,10 @@
 
 import asyncio
 import logging
-from typing import Dict, List, Optional, Sequence
+import threading
+from typing import AsyncIterator, Dict, List, Optional, Sequence
+
+#pylint: disable=broad-exception-caught
 
 try:
     from google import genai
@@ -72,7 +75,10 @@ class LLMService:
                 - metadata: LLM metadata (model, token counts, etc.)
         """
         if stream:
-            raise NotImplementedError("Streaming responses are not implemented yet.")
+            # For streaming, use the dedicated streaming method
+            raise ValueError(
+                "Use generate_chat_response_stream() for streaming responses."
+            )
 
         # Build the final prompt
         prompt = self._build_prompt(
@@ -123,6 +129,267 @@ class LLMService:
             else:
                 logger.error("Failed to generate LLM response: %s", e, exc_info=True)
                 raise RuntimeError(f"Failed to generate LLM response: {str(e)}") from e
+
+    async def generate_chat_response_stream(
+        self,
+        repo_doc: Dict,
+        memory_summary: Optional[str],
+        recent_messages: Sequence[Dict],
+        user_message: str,
+        context_string: str,
+        references: List[Dict],  # pylint: disable=unused-argument
+    ) -> AsyncIterator[str]:
+        """
+        Stream an assistant response for a chat message token-by-token.
+
+        This method builds the prompt from the provided context and calls the LLM
+        with streaming enabled, yielding text chunks as they arrive.
+
+        Args:
+            repo_doc: Repository document from MongoDB.
+            memory_summary: Optional long-term memory summary for the session.
+            recent_messages: Recent chat messages for context.
+            user_message: Current user message.
+            context_string: Formatted context string with retrieved code snippets.
+            references: List of reference metadata (file paths, chunk IDs, etc.).
+
+        Yields:
+            Text chunks as they arrive from the LLM API.
+        """
+        # Build the final prompt (same as non-streaming)
+        prompt = self._build_prompt(
+            repo_doc=repo_doc,
+            memory_summary=memory_summary,
+            recent_messages=recent_messages,
+            user_message=user_message,
+            context=context_string,
+        )
+
+        # Call the LLM with streaming
+        if not self.gemini_available:
+            raise RuntimeError("Gemini LLM service is not available.")
+
+        try:
+            async for chunk in self._call_gemini_stream(prompt, model=self.model_name):
+                yield chunk
+        except (RuntimeError, Exception) as e:
+            # Check if this is a rate limit or quota error that can be retried with fallback
+            if self._is_retryable_error(e) and self.fallback_model:
+                logger.warning(
+                    "Primary model %s failed with error: %s. Retrying with fallback model: %s",
+                    self.model_name,
+                    str(e),
+                    self.fallback_model,
+                )
+                try:
+                    async for chunk in self._call_gemini_stream(
+                        prompt, model=self.fallback_model
+                    ):
+                        yield chunk
+                except Exception as fallback_error:
+                    logger.error(
+                        "Fallback model %s also failed: %s",
+                        self.fallback_model,
+                        fallback_error,
+                        exc_info=True,
+                    )
+                    raise RuntimeError(
+                        "Both primary and fallback models failed. "
+                        f"Last error: {str(fallback_error)}"
+                    ) from fallback_error
+            else:
+                logger.error("Failed to generate streaming LLM response: %s", e, exc_info=True)
+                raise RuntimeError(f"Failed to generate streaming LLM response: {str(e)}") from e
+
+    async def _call_gemini_stream(
+        self, prompt: str, model: Optional[str] = None
+    ) -> AsyncIterator[str]:
+        """
+        Call the Gemini API to stream a response token-by-token.
+
+        Args:
+            prompt: The prompt string to send to the LLM.
+            model: Model name to use (defaults to self.model_name).
+
+        Yields:
+            Text chunks as they arrive from the Gemini API.
+        """
+        if model is None:
+            model = self.model_name
+
+        loop = asyncio.get_running_loop()
+
+        def _generate_stream_sync():
+            """
+            Synchronous wrapper for Gemini API streaming call.
+            
+            According to Gemini API docs:
+            https://ai.google.dev/gemini-api/docs/text-generation
+            
+            response = client.models.generate_content_stream(
+                model="gemini-2.5-flash",
+                contents=["Explain how AI works"]
+            )
+            for chunk in response:
+                print(chunk.text, end="")
+            """
+            try:
+                # Use generate_content_stream as per official documentation
+                if hasattr(self.client.models, "generate_content_stream"):
+                    # According to docs, generate_content_stream returns an iterator
+                    # Each chunk has a .text attribute
+                    logger.debug("Using generate_content_stream for streaming")
+                    response_stream = self.client.models.generate_content_stream(
+                        model=model,
+                        contents=prompt,  # Can be string or list
+                    )
+
+                    # Iterate over the stream and yield text chunks
+                    chunk_idx = 0
+                    for chunk in response_stream:
+                        chunk_idx += 1
+                        # According to docs, chunk.text contains the text
+                        text = None
+                        if hasattr(chunk, "text") and chunk.text:
+                            text = chunk.text
+                        # Fallback: try to extract from content structure
+                        elif hasattr(chunk, "content"):
+                            if hasattr(chunk.content, "parts"):
+                                for part in chunk.content.parts:
+                                    if hasattr(part, "text") and part.text:
+                                        text = part.text
+                                        break
+
+                        if text:
+                            logger.debug(
+                                "Gemini stream chunk %d: %d chars - '%s...'",
+                                chunk_idx,
+                                len(text),
+                                text[:50],
+                            )
+                            # Split chunks for smoother streaming UX
+                            # Use word-level splitting for better granularity
+                            if len(text) > 20:  # Lower threshold for more granular splitting
+                                # Split by words for smoother, more natural streaming
+                                words = text.split()
+                                for i, word in enumerate(words):
+                                    if i < len(words) - 1:
+                                        yield word + " "
+                                    else:
+                                        yield word
+                            else:
+                                # Small chunk, yield as-is
+                                yield text
+                else:
+                    # Fallback: simulate streaming by chunking the response
+                    logger.warning(
+                        "generate_content_stream not available, using fallback chunking"
+                    )
+                    response = self.client.models.generate_content(
+                        model=model, contents=prompt
+                    )
+                    content = response.text if hasattr(response, "text") else ""
+                    # Chunk into words for simulated streaming
+                    words = content.split()
+                    for word in words:
+                        yield word + " "
+            except Exception as e:
+                logger.error(
+                    "Gemini API streaming call failed for model %s: %s",
+                    model,
+                    e,
+                    exc_info=True,
+                )
+                raise RuntimeError(f"Gemini API streaming error: {str(e)}") from e
+
+        # Use a queue to bridge sync generator to async iterator
+        # Limit queue size to prevent memory buildup and ensure real-time streaming
+        chunk_queue = asyncio.Queue(maxsize=10)
+        exception_holder = [None]
+        done_event = threading.Event()
+
+        def _run_stream():
+            """Run the sync generator in a thread and put chunks in queue."""
+            try:
+                chunk_count = 0
+                for chunk in _generate_stream_sync():
+                    chunk_count += 1
+                    # Put chunk in async queue from sync thread
+                    # Use run_coroutine_threadsafe but don't block on result
+                    # Fire and forget - let async side consume naturally
+                    try:
+                        future = asyncio.run_coroutine_threadsafe(
+                            chunk_queue.put(chunk), loop
+                        )
+                        # Don't wait for result - this allows chunks to flow immediately
+                        # The async consumer will get chunks as fast as they're produced
+                    except Exception as e:
+                        logger.warning("Error queuing chunk %d: %s", chunk_count, e)
+                        # Continue streaming even if queue fails
+
+                logger.info("Generated %d chunks from Gemini stream", chunk_count)
+
+                # Signal completion - wait briefly to ensure it's queued
+                try:
+                    future = asyncio.run_coroutine_threadsafe(
+                        chunk_queue.put(None), loop
+                    )
+                    # Wait briefly for completion signal (max 0.1s)
+                    future.result(timeout=0.1)
+                except Exception:
+                    # If it fails, the done_event will signal completion
+                    pass
+            except Exception as e:
+                exception_holder[0] = e
+                logger.error("Error in stream thread: %s", e, exc_info=True)
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        chunk_queue.put(None), loop
+                    ).result(timeout=0.1)
+                except Exception:
+                    pass
+            finally:
+                done_event.set()
+
+        # Start the streaming in a background thread
+        thread = threading.Thread(target=_run_stream, daemon=True)
+        thread.start()
+
+        # Yield chunks as they arrive - use very short timeout for real-time streaming
+        chunk_yield_count = 0
+        while True:
+            try:
+                # Very short timeout (0.01s = 10ms) for immediate chunk delivery
+                chunk = await asyncio.wait_for(chunk_queue.get(), timeout=0.01)
+                if chunk is None:
+                    # Check for exceptions
+                    exc = exception_holder[0]
+                    if exc is not None:
+                        raise exc
+                    logger.debug("Stream complete: yielded %d chunks", chunk_yield_count)
+                    break
+                chunk_yield_count += 1
+                # Yield immediately when chunk arrives - this is critical!
+                logger.debug("Yielding chunk %d: %d chars", chunk_yield_count, len(chunk))
+                yield chunk
+            except asyncio.TimeoutError:
+                # Check if thread is done
+                if done_event.is_set():
+                    exc = exception_holder[0]
+                    if exc is not None:
+                        raise exc from exc
+                    # Check if there are any remaining items
+                    if chunk_queue.empty():
+                        break
+                    # Try to get remaining chunks without timeout
+                    try:
+                        chunk = chunk_queue.get_nowait()
+                        if chunk is None:
+                            break
+                        yield chunk
+                    except asyncio.QueueEmpty:
+                        break
+                    continue
 
     def _build_prompt(
         self,

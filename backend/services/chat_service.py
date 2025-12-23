@@ -3,13 +3,15 @@
 import logging
 import re
 from datetime import datetime
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import AsyncIterator, Dict, List, Optional, Sequence, Tuple
 from uuid import uuid4
 
 from services.llm_service import LLMService
 from services.mongodb_service import MongoDBService
 from services.retrieval_service import RetrievalService
 from utils.prompts import build_summary_prompt
+
+#pylint: disable=broad-exception-caught
 
 logger = logging.getLogger(__name__)
 
@@ -151,6 +153,164 @@ class ChatService:
             "metadata": response_metadata,
         }
 
+    async def process_message_stream(
+        self,
+        repo_id: str,
+        session_id: str,
+        user_message: str,
+    ) -> AsyncIterator[Dict]:
+        """
+        Process a user message and stream the assistant response token-by-token.
+
+        Yields:
+            Dict with structure:
+            {
+                "type": "chunk" | "done" | "error",
+                "content": str,  # For chunks
+                "message_id": str,  # For done event
+                "references": List[Dict],  # For done event
+                "metadata": Dict,  # For done event
+                "error": str,  # For error event
+            }
+        """
+        try:
+            # 1. Get repository and chat session
+            repo_doc = await self.mongodb_service.get_repository(repo_id)
+            if not repo_doc:
+                yield {
+                    "type": "error",
+                    "error": "Repository not found.",
+                }
+                return
+
+            session_doc = await self.mongodb_service.get_chat_session(repo_id, session_id)
+            if not session_doc:
+                yield {
+                    "type": "error",
+                    "error": "Chat session not found.",
+                }
+                return
+
+            # 2. Log user message immediately
+            user_message_id = await self._log_message(
+                repo_id=repo_id,
+                session_id=session_id,
+                role="user",
+                content=user_message,
+                status="completed",
+            )
+            logger.info(
+                "Processing streaming chat message (repo=%s, session=%s, user_message_id=%s)",
+                repo_id,
+                session_id,
+                user_message_id,
+            )
+
+            # 3. Fetch recent chat messages and memory summary
+            recent_messages = await self.mongodb_service.fetch_recent_chat_messages(
+                repo_id=repo_id,
+                session_id=session_id,
+                limit=self.history_message_limit,
+            )
+            memory_summary = session_doc.get("summary")
+            vector_store_id = self._build_vector_store_id(repo_doc)
+
+            # 4. Generate query embedding and search repository chunks
+            try:
+                query_embedding = await self.retrieval_service.generate_query_embedding(
+                    user_message
+                )
+            except ValueError as exc:
+                yield {
+                    "type": "error",
+                    "error": str(exc),
+                }
+                return
+            except RuntimeError as exc:
+                yield {
+                    "type": "error",
+                    "error": str(exc),
+                }
+                return
+
+            # 5. Search repository chunks and filter by similarity score
+            chunk_hits = await self.retrieval_service.search_repository_chunks(
+                repo_vector_id=vector_store_id,
+                embedding=query_embedding,
+                top_k=self.retrieval_top_k,
+            )
+            filtered_hits = [
+                (chunk_id, score)
+                for chunk_id, score in chunk_hits
+                if score >= self.min_similarity_score
+            ]
+            chunk_ids = [chunk_id for chunk_id, _ in filtered_hits]
+
+            # 6. Fetch chunk metadata and build context string
+            chunks = await self.retrieval_service.fetch_chunk_metadata(
+                chunk_ids=chunk_ids,
+                repo_id=repo_id,
+            )
+            context_string, references = self._build_context_string(chunks, filtered_hits)
+
+            # 7. Stream LLM response
+            accumulated_content = ""
+            response_metadata = {}
+            try:
+                async for chunk in self.llm_service.generate_chat_response_stream(
+                    repo_doc=repo_doc,
+                    memory_summary=memory_summary,
+                    recent_messages=recent_messages,
+                    user_message=user_message,
+                    context_string=context_string,
+                    references=references,
+                ):
+                    accumulated_content += chunk
+                    yield {
+                        "type": "chunk",
+                        "content": chunk,
+                    }
+            except RuntimeError as exc:
+                yield {
+                    "type": "error",
+                    "error": str(exc),
+                }
+                return
+
+            # 8. Log complete assistant message
+            chunk_ids_used = [ref.get("chunk_id") for ref in references if ref.get("chunk_id")]
+            assistant_message_id = await self._log_message(
+                repo_id=repo_id,
+                session_id=session_id,
+                role="assistant",
+                content=accumulated_content,
+                status="completed",
+                references=references,
+                chunks_used=chunk_ids_used,
+                metadata=response_metadata,
+            )
+
+            # 9. Send final metadata event
+            yield {
+                "type": "done",
+                "message_id": assistant_message_id,
+                "references": references,
+                "metadata": response_metadata,
+            }
+
+        except Exception as e:
+            logger.error(
+                "Error in process_message_stream (repo=%s session=%s): %s",
+                repo_id,
+                session_id,
+                e,
+                exc_info=True,
+            )
+            yield {
+                "type": "error",
+                "error": f"Failed to process message: {str(e)}",
+            }
+
     async def _log_message(
         self,
         repo_id: str,
@@ -221,7 +381,7 @@ class ChatService:
     @staticmethod
     def _build_vector_store_id(repo_doc: Dict) -> str:
         """Convert owner/repo_name/branch combo into the FAISS identifier.
-        
+
         Must match the format used in ingestion_service._extract_repo_info()
         Format: owner_repo_branch (lowercase, sanitized)
         """

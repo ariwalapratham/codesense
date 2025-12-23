@@ -695,7 +695,7 @@ class IngestionService:
                     parsed_structures,
                     batch_size=None  # Use service's default (rate-limited) batch size
                 )
-            except RuntimeError as e:
+            except RuntimeError as e:  # pylint: disable=broad-exception-caught
                 if "quota exhausted" in str(e).lower():
                     error_msg = (
                         "Daily embedding quota exhausted. "

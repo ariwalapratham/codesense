@@ -729,7 +729,7 @@ class MongoDBService:
                 "branch": 1,  # Add branch for deduplication
                 "_id": 1
             }
-            
+
             repo_docs = await self.repositories.find(
                 search_filter, repo_projection
             ).to_list(length=None)  # Get all matching repos

@@ -3,6 +3,7 @@
 import logging
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, status
+from fastapi.responses import StreamingResponse
 
 from models.schemas import (
     ChatMessageItem,
@@ -17,6 +18,7 @@ from models.schemas import (
 )
 from services.chat_service import ChatService, ChatServiceError
 from services.mongodb_service import MongoDBService
+from utils.sse import format_sse_event
 
 logger = logging.getLogger(__name__)
 
@@ -355,3 +357,160 @@ async def send_message(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to process chat message: {exc}",
         ) from exc
+
+
+@router.post(
+    "/{session_id}/messages/stream",
+    summary="Send message with streaming response (SSE)",
+    description=(
+        "Process a user query and stream the assistant response via "
+        "Server-Sent Events (SSE)."
+    ),
+)
+async def send_message_stream(
+    repo_id: str,
+    session_id: str,
+    payload: ChatMessageRequest,
+    background_tasks: BackgroundTasks,
+):
+    """
+    Stream chat response using Server-Sent Events (SSE).
+
+    This endpoint streams the assistant's response token-by-token as it's generated,
+    providing real-time feedback to the client.
+
+    Args:
+        repo_id: Repository identifier (Mongo ObjectId as string).
+        session_id: Chat session identifier (UUID/string).
+        payload: Request body containing user message.
+        background_tasks: FastAPI background tasks for async operations.
+
+    Returns:
+        StreamingResponse with SSE-formatted events:
+        - event: "chunk" - Contains partial response text
+        - event: "done" - Contains final message_id, references, and metadata
+        - event: "error" - Contains error message if something goes wrong
+    """
+    try:
+        user_message = payload.message
+
+        # Get session to check message count for background tasks
+        session_doc = await mongodb_service.get_chat_session(repo_id, session_id)
+        if not session_doc:
+            # Send error via SSE
+            async def error_stream():
+                yield await format_sse_event(
+                    "error",
+                    {"error": "Chat session not found"},
+                )
+
+            return StreamingResponse(
+                error_stream(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",  # Disable nginx buffering
+                },
+            )
+
+        messages_before = session_doc.get("messages", [])
+        is_first_message = len(messages_before) == 0
+
+        async def generate_sse_stream():
+            """Generate SSE events from chat service stream."""
+            accumulated_content = ""
+            try:
+                async for event in chat_service.process_message_stream(
+                    repo_id=repo_id,
+                    session_id=session_id,
+                    user_message=user_message,
+                ):
+                    event_type = event.get("type")
+
+                    if event_type == "chunk":
+                        accumulated_content += event.get("content", "")
+                        yield await format_sse_event("chunk", {"content": event.get("content", "")})
+
+                    elif event_type == "done":
+                        # Trigger background tasks after streaming completes
+                        if is_first_message:
+                            background_tasks.add_task(
+                                chat_service.generate_title_background,
+                                repo_id=repo_id,
+                                session_id=session_id,
+                                first_user_message=user_message,
+                            )
+
+                        total_after = len(messages_before) + 2
+                        if chat_service.should_generate_summary(total_after):
+                            background_tasks.add_task(
+                                chat_service.generate_summary_background,
+                                repo_id=repo_id,
+                                session_id=session_id,
+                            )
+
+                        # Send final event with metadata
+                        yield await format_sse_event(
+                            "done",
+                            {
+                                "message_id": event.get("message_id"),
+                                "references": event.get("references", []),
+                                "metadata": event.get("metadata", {}),
+                            },
+                        )
+                        return
+
+                    elif event_type == "error":
+                        yield await format_sse_event(
+                            "error",
+                            {"error": event.get("error", "Unknown error occurred")},
+                        )
+                        return
+
+            except Exception as exc:
+                logger.error(
+                    "Error in SSE stream (repo=%s session=%s): %s",
+                    repo_id,
+                    session_id,
+                    exc,
+                    exc_info=True,
+                )
+                yield await format_sse_event(
+                    "error",
+                    {"error": f"Failed to stream response: {str(exc)}"},
+                )
+
+        return StreamingResponse(
+            generate_sse_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",  # Disable nginx buffering
+            },
+        )
+
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.error(
+            "Failed to start streaming chat message (repo=%s session=%s): %s",
+            repo_id,
+            session_id,
+            exc,
+            exc_info=True,
+        )
+
+        async def error_stream():
+            yield await format_sse_event(
+                "error",
+                {"error": f"Failed to start streaming: {str(exc)}"},
+            )
+
+        return StreamingResponse(
+            error_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+            },
+        )

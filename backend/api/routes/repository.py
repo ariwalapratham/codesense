@@ -480,7 +480,7 @@ async def ingest_repository(
                         "request_id": active_request_id,
                         "status": active_status
                     }
-                )
+            )
         else:
             # Rate limit check (only for new requests)
             allowed, retry_count, retry_after = await mongodb_service.check_retry_rate_limit(
@@ -619,7 +619,7 @@ async def get_ingestion_status(
             except ValueError as e:
                 logger.debug("Failed to decode identifier as base64: %s", e)
                 # Continue to 404 below
-        
+
         if not ingestion_request:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
