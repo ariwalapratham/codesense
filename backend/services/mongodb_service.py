@@ -1,5 +1,7 @@
 """MongoDB service for upserting repositories and chunks."""
 
+import base64
+import json
 import logging
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Union
@@ -21,6 +23,29 @@ from schemas import (
 # pylint: disable=broad-exception-caught
 
 logger = logging.getLogger(__name__)
+
+
+def _encode_repo_identifier(owner: str, repo_name: str, branch: str) -> str:
+    """
+    Encode owner/repo_name/branch into a base64 string identifier.
+    
+    Args:
+        owner: Repository owner
+        repo_name: Repository name
+        branch: Branch name
+        
+    Returns:
+        Base64-encoded string identifier (URL-safe, no padding)
+    """
+    identifier_data = {
+        "owner": owner,
+        "repo_name": repo_name,
+        "branch": branch or "main"
+    }
+    json_str = json.dumps(identifier_data, sort_keys=True)
+    encoded = base64.urlsafe_b64encode(json_str.encode('utf-8')).decode('utf-8')
+    # Remove padding for cleaner URLs
+    return encoded.rstrip('=')
 
 
 class MongoDBService:
@@ -668,6 +693,7 @@ class MongoDBService:
     ) -> Tuple[List[Dict], int]:
         """
         List repositories with pagination and optional search.
+        Includes both completed repositories and in-progress ingestion requests.
 
         Args:
             skip: Number of repositories to skip
@@ -678,7 +704,7 @@ class MongoDBService:
             Tuple of (list of repository dictionaries, total count)
         """
         try:
-            # Build search filter
+            # Build search filter for both collections
             search_filter = {}
             if search:
                 # Case-insensitive regex search across repo_name, owner, and repository_url
@@ -691,43 +717,115 @@ class MongoDBService:
                     ]
                 }
 
-            # Get total count with search filter
-            total = await self.repositories.count_documents(search_filter)
-
-            # Projection for lightweight summary fields (matching UI requirements)
-            projection = {
+            # 1. Get completed repositories
+            repo_projection = {
                 "repo_name": 1,
                 "repository_url": 1,
                 "status": 1,
                 "files_processed": 1,
                 "created_at": 1,
                 "updated_at": 1,
+                "owner": 1,  # Add owner for deduplication
+                "branch": 1,  # Add branch for deduplication
                 "_id": 1
             }
-
-            # Fetch repositories with pagination and search, sorted by updated_at descending
-            cursor = (
-                self.repositories.find(search_filter, projection)
-                .sort("updated_at", -1)
-                .skip(skip)
-                .limit(limit)
-            )
-            repo_docs = await cursor.to_list(length=limit)
-
+            
+            repo_docs = await self.repositories.find(
+                search_filter, repo_projection
+            ).to_list(length=None)  # Get all matching repos
+            
+            # Convert to dict format using owner/repo_name/branch as key
+            repos_dict = {}
             for repo_doc in repo_docs:
-                repo_doc["id"] = str(repo_doc["_id"])
-                repo_doc.pop("_id", None)
+                owner = repo_doc.get("owner", "")
+                repo_name = repo_doc.get("repo_name", "")
+                branch = repo_doc.get("branch", "main")
+                # Use owner/repo_name/branch as key for deduplication
+                key = f"{owner}_{repo_name}_{branch}".lower()
+                
+                repos_dict[key] = {
+                    "id": str(repo_doc["_id"]),
+                    "repo_name": repo_name,
+                    "repository_url": repo_doc.get("repository_url"),
+                    "status": repo_doc.get("status", "completed"),
+                    "files_processed": repo_doc.get("files_processed", 0),
+                    "created_at": repo_doc.get("created_at"),
+                    "updated_at": repo_doc.get("updated_at"),
+                    "_source": "repository"  # Track source for deduplication
+                }
+
+            # 2. Get in-progress ingestion requests (pending/processing)
+            ingestion_filter = {
+                **search_filter,
+                "status": {"$in": ["pending", "processing"]}
+            }
+            
+            ingestion_projection = {
+                "repo_name": 1,
+                "repository_url": 1,
+                "status": 1,
+                "created_at": 1,
+                "updated_at": 1,
+                "owner": 1,
+                "branch": 1,
+                "_id": 1
+            }
+            
+            ingestion_docs = await self.ingestion_requests.find(
+                ingestion_filter, ingestion_projection
+            ).to_list(length=None)  # Get all matching requests
+            
+            # Merge ingestion requests (prefer repository if exists)
+            for req_doc in ingestion_docs:
+                owner = req_doc.get("owner", "")
+                repo_name = req_doc.get("repo_name", "")
+                branch = req_doc.get("branch", "main")
+                key = f"{owner}_{repo_name}_{branch}".lower()
+                
+                # Only add if not already in repos_dict (repository takes precedence)
+                if key not in repos_dict:
+                    # Generate encoded_id for in-progress repos
+                    encoded_id = _encode_repo_identifier(owner, repo_name, branch)
+                    
+                    repos_dict[key] = {
+                        "id": encoded_id,  # Use encoded_id for status queries
+                        "repo_name": repo_name,
+                        "repository_url": req_doc.get("repository_url"),
+                        "status": req_doc.get("status", "pending"),
+                        "files_processed": 0,  # No files processed yet
+                        "created_at": req_doc.get("created_at"),
+                        "updated_at": req_doc.get("updated_at"),
+                        "_source": "ingestion_request"
+                    }
+
+            # 3. Convert to list and sort by updated_at descending
+            all_repos = list(repos_dict.values())
+            # Sort by updated_at, handling None values
+            all_repos.sort(
+                key=lambda x: x.get("updated_at") or datetime.min,
+                reverse=True
+            )
+
+            # 4. Get total count
+            total = len(all_repos)
+
+            # 5. Apply pagination
+            paginated_repos = all_repos[skip:skip + limit]
+
+            # 6. Remove temporary _source field before returning
+            for repo in paginated_repos:
+                repo.pop("_source", None)
 
             logger.debug(
                 "Listed %d repositories (skip: %d, limit: %d, total: %d, search: %s)",
-                len(repo_docs),
+                len(paginated_repos),
                 skip,
                 limit,
                 total,
                 search or "none"
             )
 
-            return repo_docs, total
+            return paginated_repos, total
 
         except PyMongoError as e:
             logger.error(

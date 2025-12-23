@@ -30,7 +30,8 @@ class IngestionRequest(BaseModel):
 class IngestionResponse(BaseModel):
     """Response model for repository ingestion request creation."""
 
-    request_id: Optional[str] = Field(None, description="Ingestion request ID")
+    request_id: Optional[str] = Field(None, description="Ingestion request ID (MongoDB ObjectId)")
+    encoded_id: Optional[str] = Field(None, description="Encoded repository identifier (base64) - use this for status queries")
     repo_id: Optional[str] = Field(None, description="Repository ID (if linked)")
     owner: str = Field(..., description="Repository owner")
     repo_name: str = Field(..., description="Repository name")
@@ -43,6 +44,7 @@ class IngestionResponse(BaseModel):
         json_schema_extra={
             "example": {
                 "request_id": "6631c2f1e8a13b0b2fcd91aa",
+                "encoded_id": "eyJicmFuY2giOiJtYWluIiwib3duZXIiOiJvd25lciIsInJlcG9fbmFtZSI6InJlcG8ifQ",
                 "owner": "owner",
                 "repo_name": "repo",
                 "branch": "main",

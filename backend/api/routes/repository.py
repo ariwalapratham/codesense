@@ -1,9 +1,12 @@
 """Repository API routes for repository management."""
 
+import base64
+import json
 import logging
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 from urllib.parse import urlparse
 
+from bson import ObjectId
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, status
 
 from models.schemas import (
@@ -32,6 +35,57 @@ router = APIRouter(
 mongodb_service = MongoDBService()
 ingestion_service = IngestionService()
 repository_service = RepositoryService()
+
+
+def encode_repo_identifier(owner: str, repo_name: str, branch: str) -> str:
+    """
+    Encode owner/repo_name/branch into a base64 string identifier.
+    
+    Args:
+        owner: Repository owner
+        repo_name: Repository name
+        branch: Branch name
+        
+    Returns:
+        Base64-encoded string identifier (URL-safe, no padding)
+    """
+    identifier_data = {
+        "owner": owner,
+        "repo_name": repo_name,
+        "branch": branch or "main"
+    }
+    json_str = json.dumps(identifier_data, sort_keys=True)
+    encoded = base64.urlsafe_b64encode(json_str.encode('utf-8')).decode('utf-8')
+    # Remove padding for cleaner URLs
+    return encoded.rstrip('=')
+
+
+def decode_repo_identifier(encoded_id: str) -> Tuple[str, str, str]:
+    """
+    Decode base64 identifier back to owner/repo_name/branch.
+    
+    Args:
+        encoded_id: Base64-encoded identifier
+        
+    Returns:
+        Tuple of (owner, repo_name, branch)
+        
+    Raises:
+        ValueError: If decoding fails
+    """
+    try:
+        # Add padding if needed
+        padding = 4 - len(encoded_id) % 4
+        if padding != 4:
+            encoded_id += '=' * padding
+        
+        decoded_bytes = base64.urlsafe_b64decode(encoded_id.encode('utf-8'))
+        json_str = decoded_bytes.decode('utf-8')
+        data = json.loads(json_str)
+        
+        return data["owner"], data["repo_name"], data.get("branch", "main")
+    except Exception as e:
+        raise ValueError(f"Invalid repository identifier: {e}") from e
 
 def _to_repository_info(repo_dict: Dict) -> Optional[RepositoryInfo]:
     """
@@ -364,8 +418,12 @@ async def ingest_repository(
                     owner, repo_name, branch, remote_commit_hash
                 )
 
+                # Generate encoded identifier
+                encoded_id = encode_repo_identifier(owner, repo_name, branch)
+
                 return IngestionResponse(
                     request_id=None,  # No new request created
+                    encoded_id=encoded_id,
                     repo_id=repo_id,
                     owner=owner,
                     repo_name=repo_name,
@@ -481,8 +539,12 @@ async def ingest_repository(
             request_id, owner, repo_name, branch,
         )
 
+        # Generate encoded identifier for UI (can be regenerated from owner/repo_name/branch)
+        encoded_id = encode_repo_identifier(owner, repo_name, branch)
+
         return IngestionResponse(
             request_id=request_id,
+            encoded_id=encoded_id,
             repo_id=repo_id,
             owner=owner,
             repo_name=repo_name,
@@ -511,22 +573,26 @@ async def ingest_repository(
         ) from exc
 
 @router.get(
-    "/ingest/status/{request_id}",
+    "/ingest/status/{identifier}",
     response_model=IngestionStatusResponse,
-    summary="Get ingestion status by request ID",
-    description="Get the status of an ingestion request using the request_id returned from the ingest endpoint.",
+    summary="Get ingestion status",
+    description="Get ingestion status by request_id (MongoDB ObjectId) or encoded repository identifier (base64).",
 )
-async def get_ingestion_status_by_request_id(
-    request_id: str,
+async def get_ingestion_status(
+    identifier: str,
 ) -> IngestionStatusResponse:
     """
-    Get ingestion status by request ID.
+    Get ingestion status by identifier.
 
-    This is the primary way to check ingestion status. The request_id
-    is returned from the POST /repository/ingest endpoint.
+    Accepts either:
+    - MongoDB ObjectId (from ingest response request_id)
+    - Base64-encoded repository identifier (owner/repo_name/branch)
+    
+    The encoded_id is returned from POST /repository/ingest and can be
+    regenerated from owner/repo_name/branch, making it perfect for page reloads.
 
     Args:
-        request_id: Ingestion request ID (returned from ingest endpoint)
+        identifier: Either MongoDB ObjectId or base64-encoded repo identifier
 
     Returns:
         IngestionStatusResponse with current status
@@ -535,13 +601,29 @@ async def get_ingestion_status_by_request_id(
         HTTPException: If request not found
     """
     try:
-        # Get ingestion request by ID
-        ingestion_request = await mongodb_service.get_ingestion_request(request_id)
-
+        ingestion_request = None
+        
+        # Try as MongoDB ObjectId first (backward compatibility)
+        if ObjectId.is_valid(identifier):
+            ingestion_request = await mongodb_service.get_ingestion_request(identifier)
+        
+        # If not found, try as encoded identifier
+        if not ingestion_request:
+            try:
+                owner, repo_name, branch = decode_repo_identifier(identifier)
+                ingestion_request = await mongodb_service.get_ingestion_request_by_identifier(
+                    owner=owner,
+                    repo_name=repo_name,
+                    branch=branch
+                )
+            except ValueError as e:
+                logger.debug("Failed to decode identifier as base64: %s", e)
+                # Continue to 404 below
+        
         if not ingestion_request:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Ingestion request not found: {request_id}"
+                detail=f"Ingestion request not found: {identifier}"
             )
 
         # Extract data
@@ -577,141 +659,12 @@ async def get_ingestion_status_by_request_id(
         raise
     except Exception as e:
         logger.error(
-            "Error fetching ingestion status for request %s: %s",
-            request_id, e, exc_info=True
+            "Error fetching ingestion status for identifier %s: %s",
+            identifier, e, exc_info=True
         )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to fetch ingestion status: {str(e)}"
-        ) from e
-
-@router.get(
-    "/ingest/status",
-    response_model=IngestionStatusResponse,
-    summary="[LEGACY] Get repository ingestion status",
-    description="[LEGACY] Get ingestion status by repository owner, name, and branch. Use GET /repository/ingest/status/{request_id} instead.",
-    deprecated=True,
-)
-async def get_repository_status_legacy(
-    owner: str = Query(..., description="Repository owner"),
-    repo_name: str = Query(..., description="Repository name"),
-    branch: str = Query("main", description="Repository branch"),
-) -> IngestionStatusResponse:
-    """
-    Get ingestion status by repository identifier.
-
-    This endpoint is used for polling status when the frontend doesn't have repo_id yet.
-    It checks both the repository and ingestion request collections.
-
-    Args:
-        owner: Repository owner
-        repo_name: Repository name
-        branch: Repository branch (defaults to 'main')
-
-    Returns:
-        IngestionStatusResponse with current status
-
-    Raises:
-        HTTPException: If repository/request not found
-    """
-    try:
-        # First check if repository exists
-        repo = await mongodb_service.find_repository_by_identifier(
-            owner=owner,
-            repo_name=repo_name,
-            branch=branch
-        )
-
-        if repo:
-            # Repository exists, get its status
-            repo_id = str(repo.get("_id"))
-            repo_status = repo.get("status", "processing")
-
-            # Get associated ingestion request
-            ingestion_request = await mongodb_service.get_ingestion_request_by_repo_id(repo_id)
-
-            if not ingestion_request:
-                # Repository exists but no request found (legacy or manual entry)
-                # For legacy endpoint, we need a request_id, so return error
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail=(
-                        f"Repository {owner}/{repo_name} ({branch}) exists but has no ingestion request. "
-                        "Use GET /repository/{repo_id} to get repository details."
-                    )
-                )
-
-            # Return combined data from repo and request
-            return IngestionStatusResponse(
-                request_id=str(ingestion_request.get("id")),
-                repo_id=repo_id,
-                owner=owner,
-                repo_name=repo_name,
-                branch=branch,
-                commit_hash=repo.get("commit_hash"),
-                status=repo_status,  # Use repo status as source of truth
-                error=ingestion_request.get("error"),
-                retry_count=ingestion_request.get("retry_count", 0),
-                retry_after=ingestion_request.get("retry_after"),
-                message=ingestion_request.get("message") or f"Repository status: {repo_status}",
-                created_at=ingestion_request.get("created_at"),
-                started_at=ingestion_request.get("started_at"),
-                completed_at=ingestion_request.get("completed_at")
-            )
-
-        # Repository doesn't exist yet, check ingestion requests
-        ingestion_request = await mongodb_service.get_ingestion_request_by_identifier(
-            owner=owner,
-            repo_name=repo_name,
-            branch=branch
-        )
-
-        if not ingestion_request:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"No repository or ingestion request found for {owner}/{repo_name} (branch: {branch})"
-            )
-
-        # Return request status (pending/processing, no repo yet)
-        repo_id = ingestion_request.get("repo_id")
-        if repo_id:
-            repo_id = str(repo_id)
-            # Try to get commit hash from repo if it exists
-            repo = await mongodb_service.get_repository(repo_id)
-            commit_hash = repo.get("commit_hash") if repo else None
-        else:
-            commit_hash = None
-
-        return IngestionStatusResponse(
-            request_id=str(ingestion_request.get("id")),
-            repo_id=repo_id,
-            owner=owner,
-            repo_name=repo_name,
-            branch=branch,
-            commit_hash=commit_hash,
-            status=ingestion_request.get("status"),
-            error=ingestion_request.get("error"),
-            retry_count=ingestion_request.get("retry_count", 0),
-            retry_after=ingestion_request.get("retry_after"),
-            message=ingestion_request.get("message") or "Ingestion in progress",
-            created_at=ingestion_request.get("created_at"),
-            started_at=ingestion_request.get("started_at"),
-            completed_at=ingestion_request.get("completed_at")
-        )
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(
-            "Error fetching repository status for %s/%s: %s",
-            owner,
-            repo_name,
-            e,
-            exc_info=True
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to fetch repository status: {str(e)}"
         ) from e
 
 @router.post(
@@ -845,8 +798,12 @@ async def retry_ingestion(
             if repo:
                 commit_hash = repo.get("commit_hash")
 
+        # Generate encoded identifier
+        encoded_id = encode_repo_identifier(owner, repo_name, branch or "main")
+
         return IngestionResponse(
             request_id=request_id,
+            encoded_id=encoded_id,
             repo_id=repo_id,
             owner=owner,
             repo_name=repo_name,

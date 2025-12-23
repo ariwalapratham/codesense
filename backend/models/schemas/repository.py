@@ -91,7 +91,7 @@ class RepositorySummary(BaseModel):
     Minimal fields for repository cards display.
     """
 
-    id: str = Field(..., description="Unique repository identifier (MongoDB ObjectId as string)")
+    id: str = Field(..., description="Unique repository identifier (MongoDB ObjectId for completed repos, encoded_id for in-progress repos)")
     repo_name: str = Field(..., description="Repository name")
     repository_url: str = Field(..., description="Full repository URL")
     status: str = Field(default="pending", description="Repository ingestion status")
