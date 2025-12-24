@@ -222,10 +222,10 @@ class LLMService:
         def _generate_stream_sync():
             """
             Synchronous wrapper for Gemini API streaming call.
-            
+
             According to Gemini API docs:
             https://ai.google.dev/gemini-api/docs/text-generation
-            
+
             response = client.models.generate_content_stream(
                 model="gemini-2.5-flash",
                 contents=["Explain how AI works"]
@@ -267,19 +267,8 @@ class LLMService:
                                 len(text),
                                 text[:50],
                             )
-                            # Split chunks for smoother streaming UX
-                            # Use word-level splitting for better granularity
-                            if len(text) > 20:  # Lower threshold for more granular splitting
-                                # Split by words for smoother, more natural streaming
-                                words = text.split()
-                                for i, word in enumerate(words):
-                                    if i < len(words) - 1:
-                                        yield word + " "
-                                    else:
-                                        yield word
-                            else:
-                                # Small chunk, yield as-is
-                                yield text
+                            # Pass through Gemini's chunks as-is without any splitting
+                            yield text
                 else:
                     # Fallback: simulate streaming by chunking the response
                     logger.warning(
@@ -289,10 +278,9 @@ class LLMService:
                         model=model, contents=prompt
                     )
                     content = response.text if hasattr(response, "text") else ""
-                    # Chunk into words for simulated streaming
-                    words = content.split()
-                    for word in words:
-                        yield word + " "
+                    # For fallback, yield the entire response as a single chunk
+                    # (This is only used when streaming is not available)
+                    yield content
             except Exception as e:
                 logger.error(
                     "Gemini API streaming call failed for model %s: %s",
