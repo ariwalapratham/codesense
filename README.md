@@ -1,5 +1,7 @@
 # CodeSense
 
+[![gitcgr](https://gitcgr.com/badge/ariwalapratham/codesense.svg)](https://gitcgr.com/ariwalapratham/codesense)
+
 AI-powered assistant that understands code semantics, not just keywords.
 
 CodeSense is an intelligent code analysis platform that uses Retrieval-Augmented Generation (RAG) to help developers understand, analyze, and interact with their codebases. It provides semantic code search, intelligent code explanations, and conversational AI assistance for any repository.
