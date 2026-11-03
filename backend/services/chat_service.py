@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import AsyncIterator, Dict, List, Optional, Sequence, Tuple
 from uuid import uuid4
 
+from core.errors import AppError, code_for_status
 from services.llm_service import LLMService
 from services.mongodb_service import MongoDBService
 from services.retrieval_service import RetrievalService
@@ -16,12 +17,21 @@ from utils.prompts import build_summary_prompt
 logger = logging.getLogger(__name__)
 
 
-class ChatServiceError(Exception):
-    """Raised for controlled chat failures that should propagate to the API."""
+class ChatServiceError(AppError):
+    """Controlled chat failure mapped to the API error envelope."""
 
-    def __init__(self, message: str, status_code: int = 400):
-        super().__init__(message)
-        self.status_code = status_code
+    def __init__(
+        self,
+        message: str,
+        status_code: int = 400,
+        details: Optional[Dict] = None,
+    ):
+        super().__init__(
+            message,
+            code=code_for_status(status_code),
+            status_code=status_code,
+            details=details,
+        )
 
 
 class ChatService:
@@ -94,7 +104,10 @@ class ChatService:
         except ValueError as exc:
             raise ChatServiceError(str(exc), status_code=400) from exc
         except RuntimeError as exc:
-            raise ChatServiceError(str(exc), status_code=503) from exc
+            logger.error("Embedding provider failed: %s", exc)
+            raise ChatServiceError(
+                "Upstream provider unavailable", status_code=503
+            ) from exc
 
         # 5. Search repository chunks and filter by similarity score
         chunk_hits = await self.retrieval_service.search_repository_chunks(
@@ -128,7 +141,10 @@ class ChatService:
                 stream=stream,
             )
         except RuntimeError as exc:
-            raise ChatServiceError(str(exc), status_code=503) from exc
+            logger.error("LLM provider failed: %s", exc)
+            raise ChatServiceError(
+                "Upstream provider unavailable", status_code=503
+            ) from exc
 
         # 8. Log assistant response and return payload
         assistant_content = llm_response.get("content", "")

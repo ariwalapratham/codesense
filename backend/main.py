@@ -5,91 +5,76 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from pymongo.errors import PyMongoError
 
-from api.routes import chat, repository
+from api.routes import chat, health, repository
+from config.settings import settings
+from core.errors import register_exception_handlers
+from core.logging import RequestContextMiddleware, setup_logging
 from database.mongodb import mongodb
+from scripts.create_indexes import apply_indexes
 from services.chat_service import ChatService
 from services.ingestion_service import IngestionService
 from services.mongodb_service import MongoDBService
 from services.repository_service import RepositoryService
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
+setup_logging()
 logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    Lifespan context manager for FastAPI application.
-
-    Handles startup and shutdown events.
-    """
+    """Start shared services, ensure indexes, then close Mongo on shutdown."""
     logger.info("Starting application...")
+    logger.info("CORS origin: %s", settings.frontend_origin)
     app.state.mongodb_service = MongoDBService()
     app.state.ingestion_service = IngestionService()
     app.state.repository_service = RepositoryService()
     app.state.chat_service = ChatService()
 
+    try:
+        await apply_indexes(mongodb.db, include_unique=True)
+    except PyMongoError:
+        logger.exception("Failed to ensure MongoDB indexes")
+
     yield
 
-    # Shutdown
     logger.info("Shutting down application...")
     await mongodb.close()
     logger.info("MongoDB connection closed")
 
 
-# Create FastAPI application
 app = FastAPI(
     title="CodeSense API",
     description="Code search and analysis API with RAG capabilities",
     version="1.0.0",
-    lifespan=lifespan
+    lifespan=lifespan,
 )
 
-# Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # TODO: Configure specific origins in production
+    allow_origins=[settings.frontend_origin],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Request-ID", "Retry-After"],
 )
+app.add_middleware(RequestContextMiddleware)
 
-# Include routers
+register_exception_handlers(app)
+
+app.include_router(health.router)
 app.include_router(chat.router)
 app.include_router(repository.router)
 
 
 @app.get("/", tags=["root"])
 async def root():
-    """
-    Root endpoint.
-
-    Returns:
-        API information
-    """
+    """API information."""
     return {
         "name": "CodeSense API",
         "version": "1.0.0",
-        "status": "running"
-    }
-
-
-@app.get("/health", tags=["health"])
-async def health():
-    """
-    Health check endpoint.
-
-    Returns:
-        Health status
-    """
-    return {
-        "status": "healthy",
-        "service": "codesense-api"
+        "status": "running",
     }
 
 

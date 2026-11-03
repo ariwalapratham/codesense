@@ -29,6 +29,10 @@ class MongoDB:
         # Connect to database
         self.db = self.client[settings.db_name]
 
+    async def ping(self) -> None:
+        """Confirm the server is reachable."""
+        await self.client.admin.command("ping")
+
     async def close(self):
         """Close MongoDB connection."""
         await self.client.close()

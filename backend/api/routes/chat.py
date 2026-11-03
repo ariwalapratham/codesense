@@ -6,6 +6,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, s
 from fastapi.responses import StreamingResponse
 
 from api.deps import get_chat_service, get_mongodb_service
+from core.errors import AppError
 from models.schemas import (
     ChatMessageItem,
     ChatMessageListResponse,
@@ -17,7 +18,7 @@ from models.schemas import (
     ChatSessionSummary,
     ChatSessionUpdateRequest,
 )
-from services.chat_service import ChatService, ChatServiceError
+from services.chat_service import ChatService
 from services.mongodb_service import MongoDBService
 from utils.sse import format_sse_event
 
@@ -345,8 +346,8 @@ async def send_message(
 
     except HTTPException:
         raise
-    except ChatServiceError as exc:
-        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    except AppError:
+        raise
     except NotImplementedError as exc:
         logger.warning("ChatService not implemented: %s", exc)
         raise HTTPException(
