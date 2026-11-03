@@ -511,10 +511,12 @@ async def send_message_stream(
             exc_info=True,
         )
 
+        error_message = str(exc)
+
         async def error_stream():
             yield await format_sse_event(
                 "error",
-                {"error": f"Failed to start streaming: {str(exc)}"},
+                {"error": f"Failed to start streaming: {error_message}"},
             )
 
         return StreamingResponse(
