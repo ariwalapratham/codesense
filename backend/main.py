@@ -8,6 +8,10 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from api.routes import chat, repository
 from database.mongodb import mongodb
+from services.chat_service import ChatService
+from services.ingestion_service import IngestionService
+from services.mongodb_service import MongoDBService
+from services.repository_service import RepositoryService
 
 # Setup logging
 logging.basicConfig(
@@ -18,17 +22,17 @@ logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
-async def lifespan(_app: FastAPI):
+async def lifespan(app: FastAPI):
     """
     Lifespan context manager for FastAPI application.
 
     Handles startup and shutdown events.
-
-    Args:
-        _app: FastAPI application instance (required by FastAPI but unused)
     """
-    # Startup
     logger.info("Starting application...")
+    app.state.mongodb_service = MongoDBService()
+    app.state.ingestion_service = IngestionService()
+    app.state.repository_service = RepositoryService()
+    app.state.chat_service = ChatService()
 
     yield
 

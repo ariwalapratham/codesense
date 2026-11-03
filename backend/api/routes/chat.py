@@ -2,9 +2,10 @@
 
 import logging
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
 
+from api.deps import get_chat_service, get_mongodb_service
 from models.schemas import (
     ChatMessageItem,
     ChatMessageListResponse,
@@ -27,9 +28,6 @@ router = APIRouter(
     tags=["chat"],
 )
 
-chat_service = ChatService()
-mongodb_service = MongoDBService()
-
 
 @router.get(
     "/",
@@ -41,6 +39,7 @@ async def list_chat_sessions(
     repo_id: str,
     skip: int = Query(0, ge=0, description="Number of sessions to skip"),
     limit: int = Query(10, ge=1, le=100, description="Maximum number of sessions to return"),
+    mongodb_service: MongoDBService = Depends(get_mongodb_service),
 ) -> ChatSessionListResponse:
     """Return paginated chat sessions for a repository."""
     try:
@@ -88,6 +87,7 @@ async def list_chat_sessions(
 async def create_chat_session(
     repo_id: str,
     payload: ChatSessionCreateRequest,
+    mongodb_service: MongoDBService = Depends(get_mongodb_service),
 ) -> ChatSessionResponse:
     """Create a chat session."""
     try:
@@ -129,6 +129,7 @@ async def update_chat_session(
     repo_id: str,
     session_id: str,
     payload: ChatSessionUpdateRequest,
+    mongodb_service: MongoDBService = Depends(get_mongodb_service),
 ) -> ChatSessionResponse:
     """Update chat session metadata."""
     try:
@@ -183,7 +184,11 @@ async def update_chat_session(
     summary="Delete chat session",
     description="Delete a chat session and its messages.",
 )
-async def delete_chat_session(repo_id: str, session_id: str):
+async def delete_chat_session(
+    repo_id: str,
+    session_id: str,
+    mongodb_service: MongoDBService = Depends(get_mongodb_service),
+):
     """Delete a chat session."""
     try:
         deleted = await mongodb_service.delete_chat_session(repo_id, session_id)
@@ -221,6 +226,7 @@ async def list_messages(
     session_id: str,
     skip: int = Query(0, ge=0, description="Number of messages to skip"),
     limit: int = Query(50, ge=1, le=200, description="Maximum number of messages to return"),
+    mongodb_service: MongoDBService = Depends(get_mongodb_service),
 ) -> ChatMessageListResponse:
     """Get paginated messages for a chat session."""
     try:
@@ -278,6 +284,8 @@ async def send_message(
     session_id: str,
     payload: ChatMessageRequest,
     background_tasks: BackgroundTasks,
+    mongodb_service: MongoDBService = Depends(get_mongodb_service),
+    chat_service: ChatService = Depends(get_chat_service),
 ) -> ChatMessageResponse:
     """
     Entry point for chat messages.
@@ -372,6 +380,8 @@ async def send_message_stream(
     session_id: str,
     payload: ChatMessageRequest,
     background_tasks: BackgroundTasks,
+    mongodb_service: MongoDBService = Depends(get_mongodb_service),
+    chat_service: ChatService = Depends(get_chat_service),
 ):
     """
     Stream chat response using Server-Sent Events (SSE).

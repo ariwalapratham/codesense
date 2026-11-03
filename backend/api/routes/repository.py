@@ -7,8 +7,13 @@ from typing import Dict, Optional, Tuple
 from urllib.parse import urlparse
 
 from bson import ObjectId
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 
+from api.deps import (
+    get_ingestion_service,
+    get_mongodb_service,
+    get_repository_service,
+)
 from models.schemas import (
     DeleteRepositoryResponse,
     IngestionRequest,
@@ -31,10 +36,6 @@ router = APIRouter(
     prefix="/repository",
     tags=["repository"],
 )
-
-mongodb_service = MongoDBService()
-ingestion_service = IngestionService()
-repository_service = RepositoryService()
 
 
 def encode_repo_identifier(owner: str, repo_name: str, branch: str) -> str:
@@ -137,6 +138,7 @@ async def list_repositories(
     skip: int = Query(0, ge=0, description="Number of repositories to skip"),
     limit: int = Query(10, ge=1, le=100, description="Maximum number of repositories to return"),
     search: Optional[str] = Query(None, description="Search repo_name, owner, or repository_url"),
+    mongodb_service: MongoDBService = Depends(get_mongodb_service),
 ) -> RepositoryListResponse:
     """
     List repositories with pagination and optional search.
@@ -197,7 +199,10 @@ async def list_repositories(
     summary="Get repository by ID",
     description="Get detailed information about a specific repository.",
 )
-async def get_repository(repo_id: str) -> RepositoryInfo:
+async def get_repository(
+    repo_id: str,
+    mongodb_service: MongoDBService = Depends(get_mongodb_service),
+) -> RepositoryInfo:
     """
     Get detailed information about a repository.
 
@@ -241,7 +246,10 @@ async def get_repository(repo_id: str) -> RepositoryInfo:
     summary="Get repository statistics",
     description="Get aggregated statistics about a repository.",
 )
-async def get_repository_stats(repo_id: str) -> RepositoryStats:
+async def get_repository_stats(
+    repo_id: str,
+    mongodb_service: MongoDBService = Depends(get_mongodb_service),
+) -> RepositoryStats:
     """
     Get repository statistics including chunk and language distributions.
 
@@ -279,7 +287,10 @@ async def get_repository_stats(repo_id: str) -> RepositoryStats:
     summary="Delete repository",
     description="Delete a repository and all its associated data (chunks, queries, vector store).",
 )
-async def delete_repository(repo_id: str) -> DeleteRepositoryResponse:
+async def delete_repository(
+    repo_id: str,
+    ingestion_service: IngestionService = Depends(get_ingestion_service),
+) -> DeleteRepositoryResponse:
     """
     Delete a repository and all its data.
 
@@ -356,6 +367,9 @@ def _extract_repo_info(repo_url: str) -> tuple:
 async def ingest_repository(
     request: IngestionRequest,
     background_tasks: BackgroundTasks,
+    mongodb_service: MongoDBService = Depends(get_mongodb_service),
+    repository_service: RepositoryService = Depends(get_repository_service),
+    ingestion_service: IngestionService = Depends(get_ingestion_service),
 ) -> IngestionResponse:
     """
     Create an ingestion request and start processing in the background.
@@ -580,6 +594,7 @@ async def ingest_repository(
 )
 async def get_ingestion_status(
     identifier: str,
+    mongodb_service: MongoDBService = Depends(get_mongodb_service),
 ) -> IngestionStatusResponse:
     """
     Get ingestion status by identifier.
@@ -676,7 +691,9 @@ async def get_ingestion_status(
 )
 async def retry_ingestion(
     request_id: str,
-    background_tasks: BackgroundTasks
+    background_tasks: BackgroundTasks,
+    mongodb_service: MongoDBService = Depends(get_mongodb_service),
+    ingestion_service: IngestionService = Depends(get_ingestion_service),
 ) -> IngestionResponse:
     """
     Retry a failed ingestion request.
