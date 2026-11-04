@@ -7,7 +7,7 @@ import logging
 from typing import Sequence
 
 from config.settings import settings
-from services.embeddings.base import EMBEDDING_DIM, l2_normalize
+from services.embeddings.base import EMBEDDING_DIM, check_vector, l2_normalize
 from utils.rate_limit_tracker import RateLimitTracker
 
 try:
@@ -34,7 +34,10 @@ class GeminiEmbedder:
             rpm_limit=100, tpm_limit=30000, rpd_limit=1000
         )
         if genai is not None and settings.gemini_api_key:
-            self.client = genai.Client(api_key=settings.gemini_api_key)
+            self.client = genai.Client(
+                api_key=settings.gemini_api_key,
+                http_options=types.HttpOptions(timeout=60_000),
+            )
         else:
             self.client = None
 
@@ -49,7 +52,8 @@ class GeminiEmbedder:
             batch = list(texts[i : i + self.batch_size])
             raw = await self._embed_batch(batch)
             for vector in raw:
-                results.append(l2_normalize(vector) if vector else [])
+                check_vector(vector)
+                results.append(l2_normalize(vector))
             if i + self.batch_size < len(texts):
                 await asyncio.sleep(self.batch_delay)
         return results

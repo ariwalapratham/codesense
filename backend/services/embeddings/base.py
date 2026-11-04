@@ -18,6 +18,14 @@ def l2_normalize(vector: Sequence[float]) -> list[float]:
     return (arr / norm).tolist()
 
 
+def check_vector(vector: Sequence[float], dim: int = EMBEDDING_DIM) -> np.ndarray:
+    """Return the vector as an array, or raise ValueError if it is not a finite nonzero `dim`-vector."""
+    arr = np.asarray(vector, dtype=np.float64)
+    if arr.shape != (dim,) or not np.isfinite(arr).all() or not arr.any():
+        raise ValueError(f"Invalid embedding: expected a finite nonzero {dim}-d vector")
+    return arr
+
+
 class Embedder(Protocol):
     model_name: str
     dim: int
