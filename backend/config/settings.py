@@ -28,6 +28,11 @@ class Settings(BaseSettings):
     # CORS — locked to this origin (not *)
     frontend_origin: str = Field(default="http://localhost:3000")
 
+    # Qdrant — empty URL means local MemoryVectorStore (FAISS still serves ingest/chat)
+    qdrant_url: Optional[str] = None
+    qdrant_api_key: Optional[str] = None
+    qdrant_collection: str = "codesense_chunks"
+
     # Optional Configuration
     github_token: Optional[str] = None
     gitlab_token: Optional[str] = None
@@ -38,6 +43,14 @@ class Settings(BaseSettings):
         case_sensitive=False,
         extra="ignore",
     )
+
+    @field_validator("qdrant_url", "qdrant_api_key", mode="before")
+    @classmethod
+    def blank_optional(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped or None
 
     @field_validator("frontend_origin")
     @classmethod

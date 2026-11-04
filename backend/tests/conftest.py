@@ -12,6 +12,8 @@ os.environ["MONGODB_URL"] = os.environ.get(
 )
 os.environ["DB_NAME"] = "codesense_test"
 os.environ["GEMINI_API_KEY"] = ""
+os.environ["QDRANT_URL"] = ""
+os.environ["QDRANT_API_KEY"] = ""
 
 
 @pytest.fixture(scope="session")
