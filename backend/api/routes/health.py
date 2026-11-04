@@ -4,11 +4,14 @@ import logging
 import time
 from typing import Any, Dict
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from pymongo.errors import PyMongoError
 
+from api.deps import get_vector_store
+from config.settings import settings
 from core.errors import AppError
 from database.mongodb import mongodb
+from services.vector_store.base import VectorStore
 
 logger = logging.getLogger(__name__)
 
@@ -24,9 +27,17 @@ async def health() -> Dict[str, str]:
 
 
 @router.get("/health/deep", summary="Dependency health")
-async def health_deep() -> Dict[str, Any]:
-    """Ping Mongo and report per-dependency status. Qdrant is skipped until it exists."""
-    checks: Dict[str, Any] = {"qdrant": dict(_QDRANT_SKIPPED)}
+async def health_deep(
+    vector_store: VectorStore = Depends(get_vector_store),
+) -> Dict[str, Any]:
+    """Ping Mongo and Qdrant. Mongo down is 503; Qdrant down is 200 degraded while FAISS is live."""
+    checks: Dict[str, Any] = {
+        "qdrant": (
+            await _qdrant_check(vector_store)
+            if settings.qdrant_url
+            else dict(_QDRANT_SKIPPED)
+        )
+    }
     started = time.perf_counter()
     try:
         await mongodb.ping()
@@ -47,4 +58,21 @@ async def health_deep() -> Dict[str, Any]:
             details={"checks": checks},
         ) from exc
 
-    return {"status": "ok", "checks": checks}
+    status = "degraded" if checks["qdrant"].get("status") == "error" else "ok"
+    return {"status": status, "checks": checks}
+
+
+async def _qdrant_check(store: VectorStore) -> Dict[str, Any]:
+    started = time.perf_counter()
+    try:
+        await store.ping()
+        return {
+            "status": "ok",
+            "latency_ms": round((time.perf_counter() - started) * 1000, 1),
+        }
+    except Exception as exc:
+        logger.error("Qdrant ping failed: %s", exc)
+        return {
+            "status": "error",
+            "latency_ms": round((time.perf_counter() - started) * 1000, 1),
+        }

@@ -1,5 +1,6 @@
 """FastAPI application entry point."""
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -14,9 +15,12 @@ from core.logging import RequestContextMiddleware, setup_logging
 from database.mongodb import mongodb
 from scripts.create_indexes import apply_indexes
 from services.chat_service import ChatService
+from services.embeddings.fake import FakeEmbedder
+from services.embeddings.gemini import GeminiEmbedder
 from services.ingestion_service import IngestionService
 from services.mongodb_service import MongoDBService
 from services.repository_service import RepositoryService
+from services.vector_store.memory import MemoryVectorStore
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -31,6 +35,10 @@ async def lifespan(app: FastAPI):
     app.state.ingestion_service = IngestionService()
     app.state.repository_service = RepositoryService()
     app.state.chat_service = ChatService()
+    app.state.embedder = (
+        GeminiEmbedder() if settings.gemini_api_key else FakeEmbedder()
+    )
+    app.state.vector_store = await _build_vector_store()
 
     try:
         await apply_indexes(mongodb.db, include_unique=True)
@@ -40,8 +48,25 @@ async def lifespan(app: FastAPI):
     yield
 
     logger.info("Shutting down application...")
+    store = getattr(app.state, "vector_store", None)
+    close = getattr(store, "close", None)
+    if close is not None:
+        await close()
     await mongodb.close()
     logger.info("MongoDB connection closed")
+
+
+async def _build_vector_store():
+    if not settings.qdrant_url:
+        return MemoryVectorStore()
+    from services.vector_store.qdrant import QdrantVectorStore
+
+    store = QdrantVectorStore()
+    try:
+        await asyncio.wait_for(store.ensure_collection(), timeout=5)
+    except Exception:
+        logger.exception("Failed to ensure Qdrant collection")
+    return store
 
 
 app = FastAPI(
