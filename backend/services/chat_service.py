@@ -1,15 +1,16 @@
 """Chat service orchestrating the full Q&A pipeline."""
 
 import logging
-import re
 from datetime import datetime
 from typing import AsyncIterator, Dict, List, Optional, Sequence, Tuple
 from uuid import uuid4
 
 from core.errors import AppError, code_for_status
+from services.embeddings.base import Embedder
 from services.llm_service import LLMService
 from services.mongodb_service import MongoDBService
 from services.retrieval_service import RetrievalService
+from services.vector_store.base import VectorStore
 from utils.prompts import build_summary_prompt
 
 #pylint: disable=broad-exception-caught
@@ -37,9 +38,9 @@ class ChatServiceError(AppError):
 class ChatService:
     """Coordinates chat session validation, retrieval, and LLM responses."""
 
-    def __init__(self):
+    def __init__(self, *, embedder: Embedder, vector_store: VectorStore):
         self.mongodb_service = MongoDBService()
-        self.retrieval_service = RetrievalService()
+        self.retrieval_service = RetrievalService(embedder=embedder, vector_store=vector_store)
         self.llm_service = LLMService()
 
         self.history_message_limit = 6
@@ -94,27 +95,26 @@ class ChatService:
             limit=self.history_message_limit,
         )
         memory_summary = session_doc.get("summary")
-        vector_store_id = self._build_vector_store_id(repo_doc)
 
         # 4. Generate query embedding and search repository chunks
         try:
             query_embedding = await self.retrieval_service.generate_query_embedding(
                 user_message
             )
+            chunk_hits = await self.retrieval_service.search_repository_chunks(
+                repo_id=repo_id,
+                embedding=query_embedding,
+                top_k=self.retrieval_top_k,
+            )
         except ValueError as exc:
             raise ChatServiceError(str(exc), status_code=400) from exc
         except RuntimeError as exc:
-            logger.error("Embedding provider failed: %s", exc)
+            logger.error("Retrieval upstream failed: %s", exc)
             raise ChatServiceError(
                 "Upstream provider unavailable", status_code=503
             ) from exc
 
-        # 5. Search repository chunks and filter by similarity score
-        chunk_hits = await self.retrieval_service.search_repository_chunks(
-            repo_vector_id=vector_store_id,
-            embedding=query_embedding,
-            top_k=self.retrieval_top_k,
-        )
+        # 5. Filter repository chunks by similarity score
         filtered_hits = [
             (chunk_id, score)
             for chunk_id, score in chunk_hits
@@ -229,12 +229,16 @@ class ChatService:
                 limit=self.history_message_limit,
             )
             memory_summary = session_doc.get("summary")
-            vector_store_id = self._build_vector_store_id(repo_doc)
 
             # 4. Generate query embedding and search repository chunks
             try:
                 query_embedding = await self.retrieval_service.generate_query_embedding(
                     user_message
+                )
+                chunk_hits = await self.retrieval_service.search_repository_chunks(
+                    repo_id=repo_id,
+                    embedding=query_embedding,
+                    top_k=self.retrieval_top_k,
                 )
             except ValueError as exc:
                 yield {
@@ -249,12 +253,7 @@ class ChatService:
                 }
                 return
 
-            # 5. Search repository chunks and filter by similarity score
-            chunk_hits = await self.retrieval_service.search_repository_chunks(
-                repo_vector_id=vector_store_id,
-                embedding=query_embedding,
-                top_k=self.retrieval_top_k,
-            )
+            # 5. Filter repository chunks by similarity score
             filtered_hits = [
                 (chunk_id, score)
                 for chunk_id, score in chunk_hits
@@ -393,23 +392,6 @@ class ChatService:
 
         context_text = "\n\n".join(context_sections)
         return context_text, references
-
-    @staticmethod
-    def _build_vector_store_id(repo_doc: Dict) -> str:
-        """Convert owner/repo_name/branch combo into the FAISS identifier.
-
-        Must match the format used in ingestion_service._extract_repo_info()
-        Format: owner_repo_branch (lowercase, sanitized)
-        """
-        owner = repo_doc.get("owner", "")
-        repo_name = repo_doc.get("repo_name", "")
-        branch = repo_doc.get("branch", "main")  # Default to "main" if not specified
-
-        # Match ingestion service format: owner_repo_branch
-        vector_id = f"{owner}_{repo_name}_{branch}".lower()
-        vector_id = re.sub(r"[^a-z0-9_]", "_", vector_id)
-        vector_id = re.sub(r"_+", "_", vector_id).strip("_")
-        return vector_id
 
     def should_generate_summary(self, total_messages: int) -> bool:
         """

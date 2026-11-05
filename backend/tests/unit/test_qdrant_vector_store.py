@@ -74,6 +74,25 @@ async def test_delete_by_repo(store):
     assert [h.chunk_id for h in await store.search(vec, repo_id="r2")] == ["stay"]
 
 
+async def test_delete_ids_leaves_other_points(store):
+    keep = _point(repo_id="r1", chunk_id="keep", file_path="a.py", vector=_unit(1, 0))
+    drop = _point(repo_id="r1", chunk_id="drop", file_path="b.py", vector=_unit(0, 1))
+    await store.upsert([keep, drop])
+    await store.delete_ids([drop.point_id])
+    found = await store.retrieve([keep.point_id, drop.point_id])
+    assert list(found) == [keep.point_id]
+
+
+async def test_retrieve_named_dense_only(store):
+    vec = _unit(1, 0)
+    point = _point(repo_id="r1", chunk_id="c1", file_path="a.py", vector=vec)
+    await store.upsert([point])
+    found = await store.retrieve([point.point_id, "00000000-0000-0000-0000-000000000000"])
+    assert list(found) == [point.point_id]
+    assert len(found[point.point_id]) == EMBEDDING_DIM
+    assert found[point.point_id][0] == pytest.approx(vec[0], abs=1e-5)
+
+
 async def test_search_filters_path_prefix_and_language(store):
     vec = _unit(1, 0)
     await store.upsert(

@@ -20,6 +20,7 @@ from services.embeddings.gemini import GeminiEmbedder
 from services.ingestion_service import IngestionService
 from services.mongodb_service import MongoDBService
 from services.repository_service import RepositoryService
+from services.retrieval_service import RetrievalService
 from services.vector_store.memory import MemoryVectorStore
 
 setup_logging()
@@ -31,14 +32,15 @@ async def lifespan(app: FastAPI):
     """Start shared services, ensure indexes, then close Mongo on shutdown."""
     logger.info("Starting application...")
     logger.info("CORS origin: %s", settings.frontend_origin)
+    embedder = GeminiEmbedder() if settings.gemini_api_key else FakeEmbedder()
+    store = await _build_vector_store()
+    app.state.embedder = embedder
+    app.state.vector_store = store
     app.state.mongodb_service = MongoDBService()
-    app.state.ingestion_service = IngestionService()
     app.state.repository_service = RepositoryService()
-    app.state.chat_service = ChatService()
-    app.state.embedder = (
-        GeminiEmbedder() if settings.gemini_api_key else FakeEmbedder()
-    )
-    app.state.vector_store = await _build_vector_store()
+    app.state.retrieval_service = RetrievalService(embedder=embedder, vector_store=store)
+    app.state.ingestion_service = IngestionService(embedder=embedder, vector_store=store)
+    app.state.chat_service = ChatService(embedder=embedder, vector_store=store)
 
     try:
         await apply_indexes(mongodb.db, include_unique=True)

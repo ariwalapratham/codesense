@@ -30,7 +30,7 @@ async def health() -> Dict[str, str]:
 async def health_deep(
     vector_store: VectorStore = Depends(get_vector_store),
 ) -> Dict[str, Any]:
-    """Ping Mongo and Qdrant. Mongo down is 503; Qdrant down is 200 degraded while FAISS is live."""
+    """Ping Mongo and Qdrant. Configured Qdrant down is 503; omitted URL is skipped."""
     checks: Dict[str, Any] = {
         "qdrant": (
             await _qdrant_check(vector_store)
@@ -58,8 +58,14 @@ async def health_deep(
             details={"checks": checks},
         ) from exc
 
-    status = "degraded" if checks["qdrant"].get("status") == "error" else "ok"
-    return {"status": status, "checks": checks}
+    if checks["qdrant"].get("status") == "error":
+        raise AppError(
+            "Qdrant is unavailable",
+            code="upstream_error",
+            status_code=503,
+            details={"checks": checks},
+        )
+    return {"status": "ok", "checks": checks}
 
 
 async def _qdrant_check(store: VectorStore) -> Dict[str, Any]:

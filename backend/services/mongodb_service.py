@@ -508,11 +508,14 @@ class MongoDBService:
                     )
                     continue
 
-            if not operations:
-                logger.error("No valid chunks to upsert")
+            if len(operations) != len(chunks_data):
+                logger.error(
+                    "Chunk validation dropped %d of %d documents",
+                    len(chunks_data) - len(operations),
+                    len(chunks_data),
+                )
                 return False
 
-            # Bulk write
             result = await self.chunks.bulk_write(operations, ordered=False)
 
             logger.info(
@@ -530,8 +533,7 @@ class MongoDBService:
                 len(e.details.get("writeErrors", [])),
                 len(chunks_data)
             )
-            # Still return True if some operations succeeded
-            return e.details.get("nInserted", 0) + e.details.get("nModified", 0) > 0
+            return False
 
         except Exception as e:
             logger.error("Failed to upsert chunks: %s", e, exc_info=True)
@@ -564,6 +566,132 @@ class MongoDBService:
                 e
             )
             return False
+
+    async def list_embedded_hash_index(self, repo_id: str) -> Dict[str, str]:
+        """content_hash → point_id for chunks in this repo that already have a vector."""
+        try:
+            repo_object_id = self._to_object_id(repo_id)
+        except ValueError:
+            return {}
+        cursor = self.chunks.find(
+            {
+                "repo_id": repo_object_id,
+                "embedded_at": {"$ne": None},
+                "content_hash": {"$nin": [None, ""]},
+                "point_id": {"$nin": [None, ""]},
+            },
+            {"content_hash": 1, "point_id": 1},
+        )
+        index: Dict[str, str] = {}
+        async for doc in cursor:
+            digest = doc.get("content_hash")
+            point_id = doc.get("point_id")
+            if digest and point_id:
+                index[digest] = point_id
+        return index
+
+    async def list_chunk_point_ids(self, repo_id: str) -> List[str]:
+        """All stored point_ids for a repo, used to prune leftover Qdrant points."""
+        try:
+            repo_object_id = self._to_object_id(repo_id)
+        except ValueError:
+            return []
+        cursor = self.chunks.find(
+            {"repo_id": repo_object_id, "point_id": {"$nin": [None, ""]}},
+            {"point_id": 1},
+        )
+        ids: List[str] = []
+        async for doc in cursor:
+            point_id = doc.get("point_id")
+            if point_id:
+                ids.append(point_id)
+        return ids
+
+    async def list_chunks_missing_embeddings(
+        self, repo_id: str, *, limit: int = 100
+    ) -> List[Dict]:
+        """Page of chunks with embedded_at null. Reembed loops until this is empty."""
+        try:
+            repo_object_id = self._to_object_id(repo_id)
+        except ValueError:
+            return []
+        cursor = self.chunks.find(
+            {"repo_id": repo_object_id, "embedded_at": None}
+        ).limit(limit)
+        return await cursor.to_list(length=limit)
+
+    async def replace_repo_chunks(self, repo_id: str, chunks_data: List[Dict]) -> bool:
+        """Upsert the new chunk set, then delete chunk_ids that are no longer present."""
+        if not chunks_data:
+            return False
+        if not await self.upsert_chunks(chunks_data):
+            return False
+        keep_ids = [chunk["chunk_id"] for chunk in chunks_data if chunk.get("chunk_id")]
+        if not keep_ids:
+            return False
+        try:
+            await self.chunks.delete_many(
+                {
+                    "repo_id": self._to_object_id(repo_id),
+                    "chunk_id": {"$nin": keep_ids},
+                }
+            )
+            return True
+        except Exception as e:
+            logger.error(
+                "Failed to delete stale chunks for repository %s: %s",
+                repo_id,
+                e,
+                exc_info=True,
+            )
+            return False
+
+    async def mark_chunks_embedded(self, chunks: List[Dict]) -> bool:
+        """Set embedded_at / point_id / content_hash after a successful Qdrant upsert."""
+        operations: List[UpdateOne] = []
+        for chunk in chunks:
+            chunk_id = chunk.get("chunk_id")
+            if not chunk_id or not chunk.get("embedded_at"):
+                continue
+            operations.append(
+                UpdateOne(
+                    {"chunk_id": chunk_id},
+                    {
+                        "$set": {
+                            "embedded_at": chunk["embedded_at"],
+                            "embedding_model": chunk.get("embedding_model"),
+                            "point_id": chunk.get("point_id"),
+                            "content_hash": chunk.get("content_hash"),
+                            "schema_version": chunk.get("schema_version", 2),
+                        }
+                    },
+                )
+            )
+        if not operations:
+            return True
+        try:
+            await self.chunks.bulk_write(operations, ordered=False)
+            return True
+        except Exception as e:
+            logger.error("Failed to mark chunks embedded: %s", e, exc_info=True)
+            return False
+
+    async def recount_embedded_chunks(self, repo_id: str) -> int:
+        """Set csRepositories.chunks_with_embeddings from chunks with embedded_at."""
+        repo_object_id = self._to_object_id(repo_id)
+        count = await self.chunks.count_documents(
+            {"repo_id": repo_object_id, "embedded_at": {"$ne": None}}
+        )
+        await self.repositories.update_one(
+            {"_id": repo_object_id},
+            {
+                "$set": {
+                    "chunks_with_embeddings": count,
+                    "updated_at": datetime.now(),
+                }
+            },
+        )
+        return count
 
     async def delete_repository(self, repo_id: str) -> bool:
         """

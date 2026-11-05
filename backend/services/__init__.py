@@ -7,7 +7,6 @@ from services.llm_service import LLMService
 from services.parser_service import ParserService
 from services.repository_service import RepositoryService
 from services.retrieval_service import RetrievalService
-from services.vector_store_service import VectorStoreService
 
 __all__ = [
     "ChatService",
@@ -18,5 +17,4 @@ __all__ = [
     "ParserService",
     "RepositoryService",
     "RetrievalService",
-    "VectorStoreService",
 ]

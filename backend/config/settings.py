@@ -19,16 +19,13 @@ class Settings(BaseSettings):
     mongodb_url: str = "mongodb://localhost:27017"
     db_name: str = "codesense"
 
-    # Vector Store Configuration
-    vector_store_path: str = "../vector_stores"
-
     # Repository Processing Configuration
     temp_repos_path: str = "../temp_repos"
 
     # CORS — locked to this origin (not *)
     frontend_origin: str = Field(default="http://localhost:3000")
 
-    # Qdrant — empty URL means local MemoryVectorStore (FAISS still serves ingest/chat)
+    # Qdrant — empty URL means in-process MemoryVectorStore (lost on restart)
     qdrant_url: Optional[str] = None
     qdrant_api_key: Optional[str] = None
     qdrant_collection: str = "codesense_chunks"

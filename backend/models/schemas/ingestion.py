@@ -12,7 +12,9 @@ class IngestionRequest(BaseModel):
     """Request model for repository ingestion."""
 
     repo_url: HttpUrl = Field(..., description="URL of the repository to ingest")
-    branch: Optional[str] = Field("main", description="Specific branch to clone (optional)")
+    branch: Optional[str] = Field(
+        None, description="Branch to clone; omit to use the GitHub default branch"
+    )
     cleanup: bool = Field(True,
     description="Whether to cleanup temporary repository after processing")
 
