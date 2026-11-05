@@ -13,6 +13,8 @@ from pymongo import UpdateOne
 from pymongo.asynchronous.collection import AsyncCollection
 from pymongo.errors import PyMongoError
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from services.embeddings.base import EMBEDDING_DIM
 from services.embeddings.hashing import content_hash
 from services.vector_store.ids import make_point_id
