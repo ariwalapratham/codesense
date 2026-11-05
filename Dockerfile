@@ -19,8 +19,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy backend application code
 COPY backend/ .
 
-# Create directories for vector stores and temp repos
-RUN mkdir -p /app/vector_stores /app/temp_repos
+# Create directory for temporary clones
+RUN mkdir -p /app/temp_repos
 
 # Expose port
 EXPOSE 8000

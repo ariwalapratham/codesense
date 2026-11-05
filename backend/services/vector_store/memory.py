@@ -79,6 +79,20 @@ class MemoryVectorStore:
         for pid in drop:
             del self._points[pid]
 
+    async def delete_ids(self, point_ids: Sequence[str]) -> None:
+        """Remove listed point_ids; unknown ids are ignored."""
+        for pid in point_ids:
+            self._points.pop(pid, None)
+
+    async def retrieve(self, point_ids: Sequence[str]) -> dict[str, list[float]]:
+        """Return dense vectors for ids that exist in this process."""
+        out: dict[str, list[float]] = {}
+        for pid in point_ids:
+            point = self._points.get(pid)
+            if point is not None:
+                out[pid] = list(point.vector)
+        return out
+
 
 def _cosine(left: np.ndarray, right: np.ndarray) -> float:
     denom = float(np.linalg.norm(left) * np.linalg.norm(right))

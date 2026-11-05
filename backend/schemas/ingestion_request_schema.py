@@ -41,6 +41,8 @@ class IngestionRequestSchema(BaseModel):
     started_at: Optional[datetime] = Field(None, description="When processing started")
     completed_at: Optional[datetime] = Field(None, description="When processing completed")
     message: Optional[str] = Field(None, description="Status message")
+    type: str = Field(default="full", description="Job type: full or incremental")
+    trigger: str = Field(default="user", description="What created the job")
 
     model_config = ConfigDict(
         populate_by_name=True,

@@ -13,6 +13,8 @@ from services.vector_store.base import SearchHit, VectorPoint
 DENSE_VECTOR = "dense"
 SPARSE_VECTOR = "bm25"
 _TIMEOUT_S = 30
+_RETRIEVE_BATCH = 256
+_UPSERT_BATCH = 128
 _PAYLOAD_INDEXES = ("file_path", "path_prefixes", "language", "commit_hash")
 
 
@@ -83,7 +85,11 @@ class QdrantVectorStore:
                     payload=_payload(point),
                 )
             )
-        await self._client.upsert(collection_name=self.collection, points=structs)
+        for i in range(0, len(structs), _UPSERT_BATCH):
+            await self._client.upsert(
+                collection_name=self.collection,
+                points=structs[i : i + _UPSERT_BATCH],
+            )
 
     async def search(
         self,
@@ -120,6 +126,47 @@ class QdrantVectorStore:
             collection_name=self.collection,
             points_selector=_filter(repo_id=repo_id),
         )
+
+    async def delete_ids(self, point_ids: Sequence[str]) -> None:
+        """Delete listed point ids in batches. Missing ids are ignored."""
+        ids = list(point_ids)
+        for i in range(0, len(ids), _RETRIEVE_BATCH):
+            batch = ids[i : i + _RETRIEVE_BATCH]
+            if not batch:
+                continue
+            await self._client.delete(
+                collection_name=self.collection,
+                points_selector=models.PointIdsList(points=batch),
+            )
+
+    async def retrieve(self, point_ids: Sequence[str]) -> dict[str, list[float]]:
+        """Fetch named dense vectors. Missing ids are omitted."""
+        out: dict[str, list[float]] = {}
+        ids = list(point_ids)
+        for i in range(0, len(ids), _RETRIEVE_BATCH):
+            batch = ids[i : i + _RETRIEVE_BATCH]
+            if not batch:
+                continue
+            records = await self._client.retrieve(
+                collection_name=self.collection,
+                ids=batch,
+                with_payload=False,
+                with_vectors=[DENSE_VECTOR],
+            )
+            for record in records:
+                dense = _dense_vector(record.vector)
+                if dense is not None:
+                    out[str(record.id)] = dense
+        return out
+
+
+def _dense_vector(vector) -> Optional[list[float]]:
+    if vector is None:
+        return None
+    if isinstance(vector, dict):
+        dense = vector.get(DENSE_VECTOR)
+        return list(dense) if dense is not None else None
+    return list(vector)
 
 
 def _payload(point: VectorPoint) -> dict:

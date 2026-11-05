@@ -50,6 +50,9 @@ class ChatSessionSchema(BaseModel):
         description="Last update timestamp")
     messages: List[ChatMessageDocument] = Field(default_factory=list,
         description="Embedded chat messages")
+    schema_version: Optional[int] = Field(
+        None, description="Chat session document schema version"
+    )
 
     model_config = ConfigDict(
         arbitrary_types_allowed=True,

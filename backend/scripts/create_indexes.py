@@ -34,6 +34,20 @@ _NON_UNIQUE_INDEXES = {
             [("repo_id", ASCENDING), ("file_path", ASCENDING)],
             name="idx_chunks_repo_id_file_path",
         ),
+        IndexModel(
+            [("repo_id", ASCENDING), ("content_hash", ASCENDING)],
+            name="idx_chunks_repo_id_content_hash",
+        ),
+        IndexModel(
+            [("repo_id", ASCENDING), ("function_name", ASCENDING)],
+            name="idx_chunks_repo_id_function_name",
+            sparse=True,
+        ),
+        IndexModel(
+            [("repo_id", ASCENDING), ("class_name", ASCENDING)],
+            name="idx_chunks_repo_id_class_name",
+            sparse=True,
+        ),
     ],
     "csChatSessions": [
         IndexModel(

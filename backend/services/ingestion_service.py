@@ -2,76 +2,202 @@
 
 import asyncio
 import logging
-import re
 import shutil
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 from bson import ObjectId
 
 import aiofiles
+import httpx
 from git import Repo
 from git.exc import InvalidGitRepositoryError
 
 from config.settings import settings
 from schemas import ChunkMetadata, ParsingStats
 from services.embedding_service import EmbeddingService
+from services.embeddings.base import EMBEDDING_DIM, Embedder
+from services.embeddings.hashing import content_hash
 from services.mongodb_service import MongoDBService
 from services.parser_service import ParserService
 from services.repository_service import RepositoryService
-from services.vector_store_service import VectorStoreService
+from services.vector_store.base import VectorPoint, VectorStore
+from services.vector_store.ids import make_point_id, path_prefixes
 
-# Setup logger
 logger = logging.getLogger(__name__)
+
+SCHEMA_VERSION = 2
+EMBED_BATCH = 5
+
+
+async def resolve_github_default_branch(repo_url: str, branch: Optional[str]) -> str:
+    """Return `branch` if set; otherwise GitHub's default_branch. Never assumes main."""
+    if branch:
+        return branch
+    parsed = urlparse(repo_url)
+    host = (parsed.netloc or "").lower().split(":")[0]
+    parts = parsed.path.strip("/").split("/")
+    if host not in {"github.com", "www.github.com"} or len(parts) < 2:
+        raise ValueError("branch is required when the GitHub default branch cannot be resolved")
+    owner, name = parts[0], parts[1].replace(".git", "")
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": "codesense"}
+    if settings.github_token:
+        headers["Authorization"] = f"Bearer {settings.github_token}"
+    url = f"https://api.github.com/repos/{owner}/{name}"
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(url, headers=headers)
+            response.raise_for_status()
+            default = response.json().get("default_branch")
+    except httpx.HTTPError as exc:
+        raise ValueError(f"Could not resolve default branch for {owner}/{name}") from exc
+    if not isinstance(default, str) or not default.strip():
+        raise ValueError(f"GitHub did not return a default branch for {owner}/{name}")
+    return default
+
+
+async def load_reused_vectors(
+    vector_store: VectorStore,
+    hash_to_point: Dict[str, str],
+) -> Dict[str, List[float]]:
+    """Load dense vectors from the store for hashes that already have a point_id."""
+    if not hash_to_point:
+        return {}
+    vectors = await vector_store.retrieve(list(hash_to_point.values()))
+    return {
+        digest: vectors[point_id]
+        for digest, point_id in hash_to_point.items()
+        if point_id in vectors
+    }
+
+
+async def reuse_or_embed(
+    chunks: List[Dict],
+    *,
+    repo_id: str,
+    embedder: Embedder,
+    hash_to_vector: Dict[str, List[float]],
+) -> List[Dict]:
+    """Assign content_hash/point_id and fill embeddings, embedding only unseen hashes."""
+    missing_hashes: List[str] = []
+    missing_texts: List[str] = []
+    seen: set[str] = set()
+    for chunk in chunks:
+        text = chunk["code_text"]
+        digest = content_hash(text)
+        chunk["content_hash"] = digest
+        chunk["point_id"] = make_point_id(repo_id, chunk["chunk_id"])
+        if digest not in hash_to_vector and digest not in seen:
+            seen.add(digest)
+            missing_hashes.append(digest)
+            missing_texts.append(text)
+
+    for i in range(0, len(missing_texts), EMBED_BATCH):
+        batch_texts = missing_texts[i : i + EMBED_BATCH]
+        batch_hashes = missing_hashes[i : i + EMBED_BATCH]
+        vectors = await embedder.embed(batch_texts)
+        if len(vectors) != len(batch_texts):
+            raise RuntimeError(
+                f"Embedder returned {len(vectors)} vectors for {len(batch_texts)} texts"
+            )
+        for digest, vector in zip(batch_hashes, vectors):
+            if not vector:
+                raise RuntimeError("Embedder returned an empty vector")
+            hash_to_vector[digest] = vector
+
+    now = datetime.now()
+    model_name = getattr(embedder, "model_name", None)
+    for chunk in chunks:
+        vector = hash_to_vector.get(chunk["content_hash"])
+        chunk["embedding"] = vector
+        if vector is not None:
+            chunk["embedded_at"] = now
+            chunk["embedding_model"] = model_name
+            chunk["schema_version"] = SCHEMA_VERSION
+    return chunks
+
+
+def chunks_to_points(
+    chunks: Sequence[Dict],
+    *,
+    repo_id: str,
+    commit_hash: str,
+) -> List[VectorPoint]:
+    """Build Qdrant points from chunks that already have an embedding. No code_text."""
+    points: List[VectorPoint] = []
+    for chunk in chunks:
+        embedding = chunk.get("embedding")
+        if not embedding:
+            continue
+        points.append(
+            VectorPoint(
+                point_id=chunk["point_id"],
+                vector=tuple(embedding),
+                repo_id=repo_id,
+                chunk_id=chunk["chunk_id"],
+                file_path=chunk["file_path"],
+                path_prefixes=tuple(path_prefixes(chunk["file_path"])),
+                language=chunk["language"],
+                start_line=int(chunk["start_line"]),
+                end_line=int(chunk["end_line"]),
+                commit_hash=commit_hash,
+                function_name=chunk.get("function_name"),
+                class_name=chunk.get("class_name"),
+            )
+        )
+    return points
+
+
+async def index_chunks(
+    chunks: List[Dict],
+    *,
+    repo_id: str,
+    embedder: Embedder,
+    vector_store: VectorStore,
+    hash_to_point: Dict[str, str],
+    commit_hash: str,
+    stale_point_ids: Sequence[str] = (),
+) -> Tuple[List[Dict], int]:
+    """Reuse vectors by content_hash, embed misses, upsert Qdrant. Returns (chunks, embedded_count)."""
+    reused = await load_reused_vectors(vector_store, hash_to_point)
+    filled = await reuse_or_embed(
+        chunks, repo_id=repo_id, embedder=embedder, hash_to_vector=reused
+    )
+    points = chunks_to_points(filled, repo_id=repo_id, commit_hash=commit_hash)
+    await vector_store.upsert(points)
+    keep = {point.point_id for point in points}
+    drop = [pid for pid in dict.fromkeys(stale_point_ids) if pid not in keep]
+    if drop:
+        await vector_store.delete_ids(drop)
+    embedded_count = sum(1 for chunk in filled if chunk.get("embedded_at") is not None)
+    return filled, embedded_count
 
 
 class IngestionService:
     """Service to orchestrate repository ingestion pipeline."""
 
-    def __init__(self):
-        """Initialize ingestion service with configuration."""
-        # Get temp_repos_path from settings
+    def __init__(self, *, embedder: Embedder, vector_store: VectorStore):
+        """Inject the process Embedder and VectorStore. Chunking stays on EmbeddingService."""
         self.temp_repos_path = Path(settings.temp_repos_path)
         self.temp_repos_path.mkdir(exist_ok=True, parents=True)
-
-        # Initialize parser service
         self.parser_service = ParserService()
-
-        # Initialize embedding service (handles chunking and embedding)
         self.embedding_service = EmbeddingService()
-
-        # Initialize vector store service
-        self.vector_store_service = VectorStoreService()
-
-        # Initialize MongoDB service
+        self.embedder = embedder
+        self.vector_store = vector_store
         self.mongodb_service = MongoDBService()
 
     @staticmethod
-    def _extract_repo_info(repo_url: str, branch: str) -> Tuple[str, str, str]:
-        """
-        Extract repository information from URL.
-
-        Args:
-            repo_url: Repository URL (GitHub/GitLab)
-
-        Returns:
-            Tuple of (owner, repo_name, vector_store_id)
-        """
+    def _extract_repo_info(repo_url: str) -> Tuple[str, str]:
+        """Return (owner, repo_name) from a GitHub/GitLab URL."""
         parsed = urlparse(repo_url)
         path_parts = parsed.path.strip("/").split("/")
 
         if len(path_parts) >= 2:
             owner = path_parts[0]
             repo_name = path_parts[1].replace(".git", "")
-        else:
-            raise ValueError(f"Invalid repository URL format: {repo_url}")
-
-        # Create sanitized vector_store_id: owner_repo_branch (for FAISS vector store)
-        vector_store_id = f"{owner}_{repo_name}_{branch}".lower()
-        vector_store_id = re.sub(r"[^a-z0-9_]", "_", vector_store_id)
-
-        return owner, repo_name, vector_store_id
+            return owner, repo_name
+        raise ValueError(f"Invalid repository URL format: {repo_url}")
 
     def _prepare_temp_repo_path(self, repo_name: str, commit_hash: Optional[str] = None) -> Path:
         """
@@ -265,7 +391,11 @@ class IngestionService:
             "chunks_count": chunks_count,
             "chunks_with_embeddings": chunks_with_embeddings,
             "parsing_stats": ParsingStats(**parsing_stats).model_dump() if parsing_stats else None,
-            "last_ingested_at": datetime.now()
+            "last_ingested_at": datetime.now(),
+            "visibility": "public",
+            "embedding_model": getattr(self.embedder, "model_name", settings.gemini_embedding_model),
+            "embedding_dim": getattr(self.embedder, "dim", EMBEDDING_DIM),
+            "schema_version": SCHEMA_VERSION,
         }
         return repo_data
 
@@ -275,31 +405,9 @@ class IngestionService:
         repo_object_id,
         repo_url: str,
         commit_hash: Optional[str],
-        chunk_mapping: Dict[str, int]
     ) -> List[Dict]:
-        """
-        Prepare chunks data for MongoDB upsert.
-
-        Args:
-            embedded_chunks: List of chunks with embeddings
-            repo_object_id: Repository ObjectId (ObjectId or str)
-            repo_url: Repository URL
-            commit_hash: Commit hash
-            chunk_mapping: Mapping of chunk_id to embedding_index
-
-        Returns:
-            List of chunk data dictionaries
-        """
         chunks_data = []
         for chunk in embedded_chunks:
-            chunk_id = chunk["chunk_id"]
-            embedding_index = chunk_mapping.get(chunk_id, -1)
-
-            # Skip chunks without embedding index
-            if embedding_index == -1:
-                continue
-
-            # Prepare chunk metadata
             metadata = chunk.get("metadata", {})
             chunk_metadata = ChunkMetadata(
                 type=metadata.get("type", "file"),
@@ -308,9 +416,8 @@ class IngestionService:
                 split_index=metadata.get("split_index"),
                 total_splits=metadata.get("total_splits")
             )
-
-            chunk_data = {
-                "chunk_id": chunk_id,
+            chunks_data.append({
+                "chunk_id": chunk["chunk_id"],
                 "repo_id": repo_object_id if isinstance(repo_object_id, ObjectId) else ObjectId(repo_object_id),
                 "repository_url": repo_url,
                 "file_path": chunk["file_path"],
@@ -320,60 +427,63 @@ class IngestionService:
                 "language": chunk["language"],
                 "start_line": chunk["start_line"],
                 "end_line": chunk["end_line"],
-                "embedding_index": embedding_index,
                 "commit_hash": commit_hash,
-                "metadata": chunk_metadata.model_dump()
-            }
-            chunks_data.append(chunk_data)
-
+                "content_hash": chunk.get("content_hash"),
+                "point_id": chunk.get("point_id"),
+                "embedded_at": chunk.get("embedded_at"),
+                "embedding_model": chunk.get("embedding_model"),
+                "schema_version": chunk.get("schema_version", SCHEMA_VERSION),
+                "metadata": chunk_metadata.model_dump(),
+            })
         return chunks_data
 
     async def _store_embeddings(
         self,
-        embedded_chunks: List[Dict],
-        vector_store_id: str,
+        chunks: List[Dict],
         owner: str,
         repo_name: str,
         repo_url: str,
         branch: Optional[str],
         commit_hash: Optional[str],
         files_processed: int,
-        chunks_with_embeddings: int,
         parsing_stats: Optional[Dict]
     ) -> Tuple[bool, Optional[ObjectId]]:
-        """
-        Store embeddings in vector store and metadata in MongoDB.
-
-        Args:
-            embedded_chunks: List of chunks with embeddings
-            vector_store_id: Vector store identifier (string, owner_repo format for FAISS)
-            owner: Repository owner
-            repo_name: Repository name
-            repo_url: Original repository URL
-            branch: Branch name
-            commit_hash: Git commit hash
-            files_processed: Number of files processed
-            chunks_with_embeddings: Number of chunks with embeddings
-            parsing_stats: Parsing statistics
-
-        Returns:
-            True if successful, False otherwise
-        """
-
+        """Reuse hashes, write Qdrant, then persist chunk text in Mongo."""
         try:
-            # Store embeddings in FAISS (uses vector_store_id: owner_repo format)
-            logger.info("Storing embeddings in FAISS for repository: %s", vector_store_id)
-            faiss_success, chunk_mapping = await self.vector_store_service.save_embeddings(
-                embedded_chunks=embedded_chunks,
-                repo_id=vector_store_id,
-                overwrite=True  # Always overwrite for single repo
+            seed = {
+                "owner": owner,
+                "repo_name": repo_name,
+                "repository_url": repo_url,
+                "branch": branch,
+                "commit_hash": commit_hash,
+                "status": "processing",
+                "files_processed": files_processed,
+                "chunks_count": len(chunks),
+                "chunks_with_embeddings": 0,
+            }
+            existing = await self.mongodb_service.find_repository_by_identifier(
+                owner, repo_name, branch
             )
-
-            if not faiss_success:
-                logger.error("Failed to store embeddings in FAISS for repository: %s", vector_store_id)
+            repo_object_id = existing["_id"] if existing else await self.mongodb_service.upsert_repository(seed)
+            if not repo_object_id:
+                repo_object_id = await self.mongodb_service.upsert_repository(seed)
+            if not repo_object_id:
+                logger.error("Failed to upsert repository in MongoDB")
                 return False, None
 
-            # Prepare repository data (without repo_id)
+            repo_id_str = str(repo_object_id)
+            hash_to_point = await self.mongodb_service.list_embedded_hash_index(repo_id_str)
+            stale_ids = await self.mongodb_service.list_chunk_point_ids(repo_id_str)
+            filled, embedded_count = await index_chunks(
+                chunks,
+                repo_id=repo_id_str,
+                embedder=self.embedder,
+                vector_store=self.vector_store,
+                hash_to_point=hash_to_point,
+                commit_hash=commit_hash or "",
+                stale_point_ids=stale_ids,
+            )
+
             repo_data = self._prepare_repository_data(
                 owner=owner,
                 repo_name=repo_name,
@@ -381,42 +491,34 @@ class IngestionService:
                 branch=branch,
                 commit_hash=commit_hash,
                 files_processed=files_processed,
-                chunks_count=len(embedded_chunks),
-                chunks_with_embeddings=chunks_with_embeddings,
+                chunks_count=len(filled),
+                chunks_with_embeddings=embedded_count,
                 parsing_stats=parsing_stats
             )
+            await self.mongodb_service.upsert_repository(repo_data)
 
-            # Upsert repository and get ObjectId
-            logger.info("Upserting repository in MongoDB: %s/%s", owner, repo_name)
-            repo_object_id = await self.mongodb_service.upsert_repository(repo_data)
-            if not repo_object_id:
-                logger.warning("Failed to upsert repository in MongoDB, continuing...")
-                return False, None
-
-            # Prepare chunks data with ObjectId
             chunks_data = self._prepare_chunks_data(
-                embedded_chunks=embedded_chunks,
+                embedded_chunks=filled,
                 repo_object_id=repo_object_id,
                 repo_url=repo_url,
                 commit_hash=commit_hash,
-                chunk_mapping=chunk_mapping
             )
-
-            # Delete old chunks for this repo (since we're overwriting)
-            logger.info("Deleting old chunks for repository: %s", str(repo_object_id))
-            await self.mongodb_service.delete_chunks_by_repo(str(repo_object_id))
-
-            # Upsert chunks
-            logger.info("Upserting %d chunks in MongoDB for repository: %s",
-                len(chunks_data), str(repo_object_id))
-            chunks_success = await self.mongodb_service.upsert_chunks(chunks_data)
+            chunks_success = await self.mongodb_service.replace_repo_chunks(
+                repo_id_str, chunks_data
+            )
             if not chunks_success:
-                logger.warning("Failed to upsert some chunks in MongoDB, continuing...")
+                logger.error("Failed to persist chunks in MongoDB for %s", repo_id_str)
+                return False, None
 
-            logger.info("Stored %d chunks for repository %s", len(embedded_chunks), str(repo_object_id))
-            return True, repo_object_id
+            logger.info(
+                "Stored %d chunks (%d embedded) for repository %s",
+                len(filled), embedded_count, repo_id_str,
+            )
+            return True, repo_object_id if isinstance(repo_object_id, ObjectId) else ObjectId(repo_object_id)
 
-        except (OSError, ValueError, KeyError) as e:
+        except RuntimeError:
+            raise
+        except Exception as e:
             logger.error("Failed to store embeddings: %s", e, exc_info=True)
             return False, None
 
@@ -451,21 +553,7 @@ class IngestionService:
                 logger.warning(error_msg)
                 return False, error_msg, details
 
-            owner = repo.get("owner")
-            repo_name = repo.get("repo_name")
-            branch = repo.get("branch")
-
-            if not owner or not repo_name:
-                error_msg = f"Repository missing owner or repo_name: {repo_id}"
-                logger.error(error_msg)
-                return False, error_msg, details
-
-            # Generate vector_store_id (same logic as ingestion)
-            vector_store_id = f"{owner}_{repo_name}_{branch}".lower()
-            vector_store_id = re.sub(r"[^a-z0-9_]", "_", vector_store_id)
-
-            logger.info("Starting deletion of repository: %s (vector_store_id: %s)",
-                repo_id, vector_store_id)
+            logger.info("Starting deletion of repository: %s", repo_id)
 
             # Step 1: Delete all chunks
             logger.info("Deleting chunks for repository: %s", repo_id)
@@ -475,15 +563,13 @@ class IngestionService:
             logger.info("Deleting queries for repository: %s", repo_id)
             details["queries_deleted"] = await self.mongodb_service.delete_queries_by_repo(repo_id)
 
-            # Step 3: Delete vector store files
-            logger.info("Deleting vector store for repository: %s", vector_store_id)
-            # Vector store delete_index is synchronous, run in executor
-            loop = asyncio.get_event_loop()
-            details["vector_store_deleted"] = await loop.run_in_executor(
-                None,
-                self.vector_store_service.delete_index,
-                vector_store_id
-            )
+            logger.info("Deleting vector points for repository: %s", repo_id)
+            try:
+                await self.vector_store.delete_by_repo(repo_id)
+                details["vector_store_deleted"] = True
+            except Exception as exc:
+                logger.error("Failed to delete vector points for %s: %s", repo_id, exc, exc_info=True)
+                details["vector_store_deleted"] = False
 
             # Step 4: Delete repository record (last step)
             logger.info("Deleting repository record: %s", repo_id)
@@ -567,11 +653,12 @@ class IngestionService:
                     message="Processing repository..."
                 )
 
-            # Step 1: Extract repository information
+            # Step 1: Extract repository information and resolve default branch
             try:
-                owner, repo_name, vector_store_id = self._extract_repo_info(repo_url, branch)
-                logger.info("Repository info - Owner: %s, Name: %s, Vector Store ID: %s",
-                    owner, repo_name, vector_store_id)
+                owner, repo_name = self._extract_repo_info(repo_url)
+                branch = await resolve_github_default_branch(repo_url, branch)
+                logger.info("Repository info - Owner: %s, Name: %s, branch: %s",
+                    owner, repo_name, branch)
             except ValueError as e:
                 error_msg = f"Failed to extract repository information: {e}"
                 logger.error("%s", error_msg)
@@ -688,14 +775,38 @@ class IngestionService:
                 len(parsed_structures), total_functions, total_classes, total_imports
             )
 
-            # Step 7: Chunk code and generate embeddings
-            logger.info("Chunking code and generating embeddings...")
+            # Step 7: Chunk code (embed later with hash reuse)
+            logger.info("Chunking code...")
+            chunks = self.embedding_service.chunk_code(parsed_structures)
+
+            if not chunks:
+                error_msg = "Failed to chunk code"
+                logger.error(error_msg)
+                if request_id:
+                    await self.mongodb_service.update_ingestion_request_status(
+                        request_id=request_id,
+                        status="failed",
+                        error=error_msg
+                    )
+                if cleanup:
+                    await self._cleanup_temp_repo(repo_path)
+                return False, error_msg
+
+            logger.info("Created %d chunks", len(chunks))
+
+            logger.info("Indexing chunks in Qdrant and MongoDB...")
             try:
-                embedded_chunks = await self.embedding_service.chunk_and_embed(
-                    parsed_structures,
-                    batch_size=None  # Use service's default (rate-limited) batch size
+                store_success, repo_object_id = await self._store_embeddings(
+                    chunks=chunks,
+                    owner=owner,
+                    repo_name=repo_name,
+                    repo_url=repo_url,
+                    branch=branch,
+                    commit_hash=commit_hash,
+                    files_processed=len(code_files),
+                    parsing_stats=parsing_stats
                 )
-            except RuntimeError as e:  # pylint: disable=broad-exception-caught
+            except RuntimeError as e:
                 if "quota exhausted" in str(e).lower():
                     error_msg = (
                         "Daily embedding quota exhausted. "
@@ -713,45 +824,6 @@ class IngestionService:
                         await self._cleanup_temp_repo(repo_path)
                     return False, error_msg
                 raise
-
-            if not embedded_chunks:
-                error_msg = "Failed to chunk code and generate embeddings"
-                logger.error(error_msg)
-                if request_id:
-                    await self.mongodb_service.update_ingestion_request_status(
-                        request_id=request_id,
-                        status="failed",
-                        error=error_msg
-                    )
-                if cleanup:
-                    await self._cleanup_temp_repo(repo_path)
-                return False, error_msg
-
-            # Count chunks with successful embeddings
-            chunks_with_embeddings = sum(
-                1 for chunk in embedded_chunks
-                if chunk.get("embedding") is not None
-            )
-
-            logger.info(
-                "Created %d chunks, %d with embeddings",
-                len(embedded_chunks), chunks_with_embeddings
-            )
-
-            # Step 9: Store embeddings and metadata
-            logger.info("Storing embeddings and metadata...")
-            store_success, repo_object_id = await self._store_embeddings(
-                embedded_chunks=embedded_chunks,
-                vector_store_id=vector_store_id,
-                owner=owner,
-                repo_name=repo_name,
-                repo_url=repo_url,
-                branch=branch,
-                commit_hash=commit_hash,
-                files_processed=len(code_files),
-                chunks_with_embeddings=chunks_with_embeddings,
-                parsing_stats=parsing_stats
-            )
 
             if not store_success:
                 error_msg = "Failed to store embeddings"
@@ -780,8 +852,8 @@ class IngestionService:
                 await self._cleanup_temp_repo(repo_path)
 
             success_msg = (
-                f"Successfully ingested repository {vector_store_id}. "
-                f"Processed {len(code_files)} files and created {len(embedded_chunks)} chunks."
+                f"Successfully ingested repository {owner}/{repo_name} ({branch}). "
+                f"Processed {len(code_files)} files and created {len(chunks)} chunks."
             )
             logger.info(success_msg)
 
