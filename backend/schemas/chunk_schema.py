@@ -44,11 +44,26 @@ class ChunkSchema(BaseModel):
     language: str = Field(..., description="Programming language")
     start_line: int = Field(..., description="Starting line number")
     end_line: int = Field(..., description="Ending line number")
-    embedding_index: int = Field(
-        ..., description="Index position in FAISS vector store"
+    embedding_index: Optional[int] = Field(
+        None, description="Index position in FAISS vector store (deprecated)"
     )
     commit_hash: Optional[str] = Field(
         None, description="Commit hash when chunk was created"
+    )
+    content_hash: Optional[str] = Field(
+        None, description="sha256 of the exact string sent to the embedder"
+    )
+    point_id: Optional[str] = Field(
+        None, description="Deterministic Qdrant point id"
+    )
+    embedded_at: Optional[datetime] = Field(
+        None, description="Set when the vector is in Qdrant"
+    )
+    embedding_model: Optional[str] = Field(
+        None, description="Model that produced the vector"
+    )
+    schema_version: Optional[int] = Field(
+        None, description="Chunk document schema version"
     )
     metadata: ChunkMetadata = Field(
         ..., description="Additional chunk metadata"

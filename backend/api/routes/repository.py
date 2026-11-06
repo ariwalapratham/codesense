@@ -14,7 +14,10 @@ from api.deps import (
     get_job_queue,
     get_mongodb_service,
     get_repository_service,
+    get_retrieval_service,
 )
+from config.settings import settings
+from core.errors import AppError
 from models.schemas import (
     DeleteRepositoryResponse,
     IngestionRequest,
@@ -25,14 +28,20 @@ from models.schemas import (
     RepositoryListResponse,
     RepositorySummary,
     RepositoryStats,
+    SearchHitResponse,
+    SearchResponse,
 )
 from schemas import IngestionStatus
-from services.ingestion_service import IngestionService
+from services.ingestion_service import IngestionService, resolve_github_default_branch
 from services.jobs.queue import JobQueue
 from services.mongodb_service import MongoDBService
 from services.repository_service import RepositoryService
+from services.retrieval_service import RetrievalService
+from utils.rate_limit_tracker import RateLimitTracker
 
 logger = logging.getLogger(__name__)
+
+_search_limiter = RateLimitTracker(rpm_limit=30, tpm_limit=30000, rpd_limit=200)
 
 router = APIRouter(
     prefix="/repository",
@@ -324,6 +333,72 @@ async def get_repository_stats(
         ) from exc
 
 
+@router.get(
+    "/{repo_id}/search",
+    response_model=SearchResponse,
+    summary="Search repository chunks",
+    description="Semantic search over indexed chunks. Returns code_text from Mongo.",
+)
+async def search_repository(
+    repo_id: str,
+    q: str = Query(..., min_length=1),
+    top_k: int = Query(10, ge=1, le=30),
+    path_prefix: Optional[str] = Query(None),
+    language: Optional[str] = Query(None),
+    mongodb_service: MongoDBService = Depends(get_mongodb_service),
+    retrieval_service: RetrievalService = Depends(get_retrieval_service),
+) -> SearchResponse:
+    query = q.strip()
+    if not query:
+        raise AppError(
+            "Query is empty",
+            code="validation_error",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+    repo = await mongodb_service.get_repository(repo_id)
+    if not repo:
+        raise AppError(
+            f"Repository not found: {repo_id}",
+            code="not_found",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+    if not settings.gemini_api_key:
+        raise AppError(
+            "Embedding provider unavailable",
+            code="upstream_error",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+    tokens = max(1, len(query) // 4)
+    allowed, wait = await _search_limiter.can_make_request(tokens)
+    if not allowed:
+        retry_after = int(wait or 1)
+        raise AppError(
+            "Search rate limit exceeded",
+            code="rate_limited",
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            details={"retry_after": retry_after},
+        )
+    await _search_limiter.record_request(tokens)
+    try:
+        hits = await retrieval_service.search_with_text(
+            repo_id,
+            query,
+            top_k=top_k,
+            path_prefix=path_prefix,
+            language=language,
+        )
+    except ValueError as exc:
+        raise AppError(str(exc), code="validation_error", status_code=400) from exc
+    except RuntimeError as exc:
+        logger.error("Search upstream failed for %s: %s", repo_id, exc)
+        raise AppError(
+            "Upstream provider unavailable",
+            code="upstream_error",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        ) from exc
+    return SearchResponse(results=[SearchHitResponse(**hit) for hit in hits])
+
+
 @router.delete(
     "/{repo_id}",
     response_model=DeleteRepositoryResponse,
@@ -443,7 +518,13 @@ async def ingest_repository(
                 detail=str(exc),
             ) from exc
 
-        branch = request.branch or "main" # default branch is main
+        try:
+            branch = await resolve_github_default_branch(repo_url, request.branch)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(exc),
+            ) from exc
 
         # Check if repository already exists with same owner, repo_name, and branch
         existing_repo = await mongodb_service.find_repository_by_identifier(

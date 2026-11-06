@@ -1,4 +1,10 @@
-from scripts.create_indexes import DuplicateGroup, DuplicateReport, format_duplicate_reports
+from scripts.create_indexes import (
+    DuplicateGroup,
+    DuplicateReport,
+    _NON_UNIQUE_INDEXES,
+    _UNIQUE_INDEXES,
+    format_duplicate_reports,
+)
 
 
 def test_format_duplicate_reports_lists_groups():
@@ -15,3 +21,25 @@ def test_format_duplicate_reports_lists_groups():
     assert "{'chunk_id': 'abc'} x3" in text
     assert "csRepositories" not in text
     assert "Fix duplicates by hand" in text
+
+
+def test_chunk_v2_non_unique_indexes_present():
+    names = {model.document["name"] for model in _NON_UNIQUE_INDEXES["csChunks"]}
+    assert names >= {
+        "idx_chunks_repo_id_file_path",
+        "idx_chunks_repo_id_content_hash",
+        "idx_chunks_repo_id_function_name",
+        "idx_chunks_repo_id_class_name",
+    }
+    sparse = {
+        model.document["name"]: model.document.get("sparse")
+        for model in _NON_UNIQUE_INDEXES["csChunks"]
+    }
+    assert sparse["idx_chunks_repo_id_function_name"] is True
+    assert sparse["idx_chunks_repo_id_class_name"] is True
+    unique_names = {
+        model.document["name"]
+        for models in _UNIQUE_INDEXES.values()
+        for model in models
+    }
+    assert "ux_chunks_point_id" not in unique_names

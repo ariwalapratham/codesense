@@ -3,6 +3,7 @@
 from datetime import datetime
 from typing import List, Optional
 
+from bson import ObjectId
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -45,8 +46,24 @@ class RepositorySchema(BaseModel):
     last_ingested_at: Optional[datetime] = Field(
         None, description="Last successful ingestion timestamp"
     )
+    visibility: Optional[str] = Field(
+        None, description="public or private"
+    )
+    owner_user_id: Optional[ObjectId] = Field(
+        None, description="Owner user id; null for shared public repos"
+    )
+    embedding_model: Optional[str] = Field(
+        None, description="Embedding model used for this repo"
+    )
+    embedding_dim: Optional[int] = Field(
+        None, description="Embedding dimension"
+    )
+    schema_version: Optional[int] = Field(
+        None, description="Repository document schema version"
+    )
 
     model_config = ConfigDict(
+        arbitrary_types_allowed=True,
         json_schema_extra={
             "example": {
                 "owner": "owner",

@@ -9,6 +9,7 @@ from .repository import (
     RepositoryStats,
     RepositorySummary,
 )
+from .search import SearchHitResponse, SearchResponse
 from .chat import (
     ChatMessageItem,
     ChatMessageListResponse,
@@ -33,6 +34,8 @@ __all__ = [
     "RepositoryListResponse",
     "RepositoryStats",
     "RepositorySummary",
+    "SearchHitResponse",
+    "SearchResponse",
     # Chat
     "ChatMessageItem",
     "ChatMessageListResponse",

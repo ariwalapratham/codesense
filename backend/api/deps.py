@@ -3,10 +3,13 @@
 from fastapi import Request
 
 from services.chat_service import ChatService
+from services.embeddings.base import Embedder
 from services.ingestion_service import IngestionService
 from services.jobs.queue import JobQueue
 from services.mongodb_service import MongoDBService
 from services.repository_service import RepositoryService
+from services.retrieval_service import RetrievalService
+from services.vector_store.base import VectorStore
 
 
 def get_mongodb_service(request: Request) -> MongoDBService:
@@ -32,3 +35,18 @@ def get_chat_service(request: Request) -> ChatService:
 def get_job_queue(request: Request) -> JobQueue:
     """Return the shared ingestion job queue from application state."""
     return request.app.state.job_queue
+
+
+def get_embedder(request: Request) -> Embedder:
+    """Return the shared embedder from application state."""
+    return request.app.state.embedder
+
+
+def get_vector_store(request: Request) -> VectorStore:
+    """Return the shared vector store from application state."""
+    return request.app.state.vector_store
+
+
+def get_retrieval_service(request: Request) -> RetrievalService:
+    """Return the shared retrieval service from application state."""
+    return request.app.state.retrieval_service

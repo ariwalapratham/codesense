@@ -19,14 +19,16 @@ class Settings(BaseSettings):
     mongodb_url: str = "mongodb://localhost:27017"
     db_name: str = "codesense"
 
-    # Vector Store Configuration
-    vector_store_path: str = "../vector_stores"
-
     # Repository Processing Configuration
     temp_repos_path: str = "../temp_repos"
 
     # CORS — locked to this origin (not *)
     frontend_origin: str = Field(default="http://localhost:3000")
+
+    # Qdrant — empty URL means in-process MemoryVectorStore (lost on restart)
+    qdrant_url: Optional[str] = None
+    qdrant_api_key: Optional[str] = None
+    qdrant_collection: str = "codesense_chunks"
 
     # Optional Configuration
     github_token: Optional[str] = None
@@ -38,6 +40,14 @@ class Settings(BaseSettings):
         case_sensitive=False,
         extra="ignore",
     )
+
+    @field_validator("qdrant_url", "qdrant_api_key", mode="before")
+    @classmethod
+    def blank_optional(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped or None
 
     @field_validator("frontend_origin")
     @classmethod
