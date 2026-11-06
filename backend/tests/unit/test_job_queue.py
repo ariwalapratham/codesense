@@ -1,5 +1,5 @@
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 import pytest
@@ -37,7 +37,7 @@ async def jobs():
     ids = []
 
     async def insert(**fields):
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         doc = {
             "owner": f"cs-jobq-{uuid4().hex[:8]}",
             "repo_name": "repo",
@@ -75,8 +75,8 @@ async def jobs():
 async def test_claim_oldest_pending(jobs):
     collection, insert = jobs
     queue = JobQueue(collection)
-    older = datetime.now() - timedelta(minutes=5)
-    newer = datetime.now() - timedelta(minutes=1)
+    older = datetime.now(timezone.utc) - timedelta(minutes=5)
+    newer = datetime.now(timezone.utc) - timedelta(minutes=1)
     first_id = await insert(created_at=older, repo_name="older")
     await insert(created_at=newer, repo_name="newer")
 
@@ -91,7 +91,7 @@ async def test_claim_oldest_pending(jobs):
 async def test_live_lease_is_not_stolen(jobs):
     collection, insert = jobs
     queue = JobQueue(collection)
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
     await insert(
         status="processing",
         claim_count=1,
@@ -108,7 +108,7 @@ async def test_live_lease_is_not_stolen(jobs):
 async def test_expired_lease_is_reclaimed(jobs):
     collection, insert = jobs
     queue = JobQueue(collection)
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
     job_id = await insert(
         status="processing",
         claim_count=1,
@@ -131,7 +131,7 @@ async def test_cancel_pending_excludes_job_from_claim(jobs):
     queue = JobQueue(collection)
     job_id = await insert()
 
-    cancelled = await queue.cancel_pending(str(job_id))
+    cancelled = await queue.cancel(str(job_id))
     assert cancelled is not None
     assert cancelled["status"] == "cancelled"
     assert cancelled["completed_at"] is not None
@@ -141,7 +141,7 @@ async def test_cancel_pending_excludes_job_from_claim(jobs):
 async def test_claim_count_increments_and_trips_max(jobs):
     collection, insert = jobs
     queue = JobQueue(collection)
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
     job_id = await insert()
 
     first = await queue.claim(WORKER_A)
@@ -162,12 +162,51 @@ async def test_claim_count_increments_and_trips_max(jobs):
     assert stored["claim_count"] == MAX_CLAIM_COUNT + 1
 
 
+async def test_started_at_is_preserved_on_reclaim(jobs):
+    collection, insert = jobs
+    queue = JobQueue(collection)
+    first = await queue.claim(WORKER_A)
+    started_at = first["started_at"]
+    await collection.update_one(
+        {"_id": ObjectId(first["id"])},
+        {"$set": {"lease.expires_at": datetime.now(timezone.utc) - timedelta(seconds=1)}},
+    )
+    claimed = await queue.claim(WORKER_B)
+    assert claimed["id"] == first["id"]
+    assert claimed["started_at"] == started_at
+    assert claimed["claim_count"] == 2
+
+
+async def test_cancel_processing_job(jobs):
+    collection, insert = jobs
+    queue = JobQueue(collection)
+    job_id = await insert()
+    claimed = await queue.claim(WORKER_A)
+    assert claimed["id"] == str(job_id)
+    cancelled = await queue.cancel(str(job_id))
+    assert cancelled["status"] == "cancelled"
+    assert await queue.is_cancelled(str(job_id))
+    assert await queue.complete(str(job_id), message="nope") is False
+
+
+async def test_prepare_retry_increments_retry_count(jobs):
+    collection, insert = jobs
+    queue = JobQueue(collection)
+    job_id = await insert(status="failed", retry_count=1)
+
+    retried = await queue.prepare_retry(str(job_id))
+    assert retried is not None
+    assert retried["status"] == "pending"
+    assert retried["retry_count"] == 2
+    assert retried["claim_count"] == 0
+
+
 async def test_stale_streaming_messages_are_marked_failed():
     client = await _require_mongo()
     sessions = client[settings.db_name]["csChatSessions"]
     session_id = f"cs-jobq-{uuid4().hex}"
     repo_id = ObjectId()
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
     await sessions.insert_one(
         {
             "session_id": session_id,

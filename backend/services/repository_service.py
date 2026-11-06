@@ -317,3 +317,51 @@ class RepositoryService:
                     return None
 
         return None
+
+    @staticmethod
+    async def get_repo_size_kb(repo_url: str) -> Optional[int]:
+        """Return GitHub/GitLab repo size in KB, or None if it cannot be read."""
+        repo_type = RepositoryService._detect_repository_type(repo_url)
+        token = RepositoryService._get_token_for_repo(repo_url)
+        parsed = urlparse(repo_url)
+        path = parsed.path.strip("/").replace(".git", "")
+        parts = path.split("/")
+        if len(parts) < 2:
+            return None
+        owner, repo = parts[0], parts[1]
+        headers: dict = {}
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                if repo_type == "github":
+                    if token:
+                        headers["Authorization"] = f"Bearer {token}"
+                    headers["Accept"] = "application/vnd.github+json"
+                    headers["User-Agent"] = "codesense"
+                    response = await client.get(
+                        f"https://api.github.com/repos/{owner}/{repo}",
+                        headers=headers,
+                    )
+                    if response.status_code != 200:
+                        return None
+                    size = response.json().get("size")
+                    return int(size) if size is not None else None
+                if repo_type == "gitlab":
+                    if token:
+                        headers["PRIVATE-TOKEN"] = token
+                    project_id = quote(f"{owner}/{repo}", safe="")
+                    response = await client.get(
+                        f"https://gitlab.com/api/v4/projects/{project_id}",
+                        headers=headers,
+                        params={"statistics": "true"},
+                    )
+                    if response.status_code != 200:
+                        return None
+                    stats = response.json().get("statistics") or {}
+                    bytes_size = stats.get("repository_size")
+                    if bytes_size is None:
+                        return None
+                    return int(bytes_size) // 1024
+        except (httpx.HTTPError, TypeError, ValueError):
+            return None
+        return None
+

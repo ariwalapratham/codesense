@@ -1,6 +1,6 @@
 """Pydantic schema for chat session documents in MongoDB."""
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Literal, Optional
 
 from bson import ObjectId
@@ -13,7 +13,10 @@ class ChatMessageDocument(BaseModel):
     message_id: str = Field(..., description="UUID for the message")
     role: Literal["user", "assistant"] = Field(..., description="Message author role")
     content: str = Field(..., description="Message content")
-    timestamp: datetime = Field(default_factory=datetime.utcnow, description="Message timestamp")
+    timestamp: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        description="Message timestamp",
+    )
     chunks_used: Optional[List[str]] = Field(
         default=None,
         description="Chunk identifiers referenced when answering",

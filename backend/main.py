@@ -19,6 +19,7 @@ from services.embeddings.fake import FakeEmbedder
 from services.embeddings.gemini import GeminiEmbedder
 from services.ingestion_service import IngestionService
 from services.jobs.queue import JobQueue
+from services.jobs.worker import IngestionWorker
 from services.mongodb_service import MongoDBService
 from services.repository_service import RepositoryService
 from services.retrieval_service import RetrievalService
@@ -41,24 +42,46 @@ async def lifespan(app: FastAPI):
     app.state.job_queue = JobQueue(app.state.mongodb_service.ingestion_requests)
     app.state.repository_service = RepositoryService()
     app.state.retrieval_service = RetrievalService(embedder=embedder, vector_store=store)
-    app.state.ingestion_service = IngestionService(embedder=embedder, vector_store=store)
+    app.state.ingestion_service = IngestionService(
+        embedder=embedder,
+        vector_store=store,
+        job_queue=app.state.job_queue,
+    )
     app.state.chat_service = ChatService(embedder=embedder, vector_store=store)
+    app.state.job_worker = IngestionWorker(
+        app.state.job_queue,
+        app.state.ingestion_service,
+    )
 
     try:
         await apply_indexes(mongodb.db, include_unique=True)
     except PyMongoError:
         logger.exception("Failed to ensure MongoDB indexes")
-    else:
-        recovered = await app.state.mongodb_service.fail_stale_streaming_messages()
-        if recovered:
-            logger.info(
-                "Recovered %s chat session(s) with stale streaming messages",
-                recovered,
-            )
+
+    stuck = await app.state.mongodb_service.recover_stuck_processing_jobs()
+    if stuck:
+        logger.info("Recovered %s stuck processing job(s)", stuck)
+    recovered = await app.state.mongodb_service.fail_stale_streaming_messages()
+    if recovered:
+        logger.info(
+            "Recovered %s chat session(s) with stale streaming messages",
+            recovered,
+        )
+
+    worker_task = None
+    if settings.ingestion_worker_enabled:
+        worker_task = asyncio.create_task(app.state.job_worker.run())
 
     yield
 
     logger.info("Shutting down application...")
+    if worker_task is not None:
+        await app.state.job_worker.stop()
+        try:
+            await asyncio.wait_for(worker_task, timeout=25)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            worker_task.cancel()
+
     store = getattr(app.state, "vector_store", None)
     close = getattr(store, "close", None)
     if close is not None:

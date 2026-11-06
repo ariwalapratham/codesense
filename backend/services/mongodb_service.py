@@ -3,7 +3,7 @@
 import base64
 import json
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple, Union
 
 from bson import ObjectId
@@ -349,8 +349,8 @@ class MongoDBService:
     async def fail_stale_streaming_messages(self, *, older_than_minutes: int = 10) -> int:
         """Mark streaming chat messages older than the cutoff as failed."""
         try:
-            cutoff = datetime.now() - timedelta(minutes=older_than_minutes)
-            now = datetime.now()
+            now = datetime.now(timezone.utc)
+            cutoff = now - timedelta(minutes=older_than_minutes)
             result = await self.chat_sessions.update_many(
                 {
                     "messages": {
@@ -383,6 +383,58 @@ class MongoDBService:
                 exc_info=True,
             )
             return 0
+
+    async def recover_stuck_processing_jobs(self) -> int:
+        """Make lease-less processing jobs claimable after a process death."""
+        try:
+            now = datetime.now(timezone.utc)
+            result = await self.ingestion_requests.update_many(
+                {
+                    "status": "processing",
+                    "$or": [
+                        {"lease": None},
+                        {"lease.expires_at": {"$exists": False}},
+                        {"lease.expires_at": None},
+                    ],
+                },
+                {
+                    "$set": {
+                        "lease.expires_at": now - timedelta(seconds=1),
+                        "updated_at": now,
+                    }
+                },
+            )
+            if result.modified_count:
+                logger.info(
+                    "Marked %s stuck processing job(s) as claimable",
+                    result.modified_count,
+                )
+            return result.modified_count
+        except Exception as e:  # pylint: disable=broad-except
+            logger.error(
+                "Failed to recover stuck processing jobs: %s",
+                e,
+                exc_info=True,
+            )
+            return 0
+
+    async def release_repo_if_processing(self, repo_id: str) -> None:
+        """Unstick a repo left in processing after its job was cancelled."""
+        try:
+            repo_oid = self._to_object_id(repo_id)
+        except ValueError:
+            return
+        repo = await self.repositories.find_one(
+            {"_id": repo_oid},
+            {"status": 1, "last_ingested_at": 1},
+        )
+        if not repo or repo.get("status") != "processing":
+            return
+        new_status = "completed" if repo.get("last_ingested_at") else "failed"
+        await self.repositories.update_one(
+            {"_id": repo_oid, "status": "processing"},
+            {"$set": {"status": new_status, "updated_at": datetime.now(timezone.utc)}},
+        )
 
     async def fetch_recent_chat_messages(
         self,

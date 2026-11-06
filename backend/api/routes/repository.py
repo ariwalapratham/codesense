@@ -7,7 +7,7 @@ from typing import Dict, Optional, Tuple
 from urllib.parse import urlparse
 
 from bson import ObjectId
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from api.deps import (
     get_ingestion_service,
@@ -455,6 +455,26 @@ async def delete_repository(
         ) from exc
 
 
+async def _reject_if_too_large(
+    repository_service: RepositoryService,
+    repo_url: str,
+) -> None:
+    """Raise 413 if the repo is over MAX_REPO_SIZE_MB or its size cannot be read."""
+    size_kb = await repository_service.get_repo_size_kb(repo_url)
+    limit_kb = settings.max_repo_size_mb * 1024
+    if size_kb is None or size_kb > limit_kb:
+        raise AppError(
+            (
+                "Could not determine repository size"
+                if size_kb is None
+                else f"Repository exceeds the {settings.max_repo_size_mb} MB size limit"
+            ),
+            code="repo_too_large",
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            details={"limit_mb": settings.max_repo_size_mb, "size_kb": size_kb},
+        )
+
+
 def _extract_repo_info(repo_url: str) -> tuple:
     """
     Extract repository owner and name from URL.
@@ -484,10 +504,9 @@ def _extract_repo_info(repo_url: str) -> tuple:
 )
 async def ingest_repository(
     request: IngestionRequest,
-    background_tasks: BackgroundTasks,
     mongodb_service: MongoDBService = Depends(get_mongodb_service),
     repository_service: RepositoryService = Depends(get_repository_service),
-    ingestion_service: IngestionService = Depends(get_ingestion_service),
+    job_queue: JobQueue = Depends(get_job_queue),
 ) -> IngestionResponse:
     """
     Create an ingestion request and start processing in the background.
@@ -548,7 +567,6 @@ async def ingest_repository(
             existing_commit = existing_repo.get("commit_hash")
 
             if existing_commit == remote_commit_hash:
-                # Exact same version already ingested
                 repo_id = str(existing_repo.get("_id"))
 
                 logger.info(
@@ -601,14 +619,17 @@ async def ingest_repository(
                     }
                 )
 
-            # Only reuse if status is FAILED (allow retry)
             if active_status == IngestionStatus.FAILED:
                 request_id = active_request_id
                 repo_id = active_request.get("repo_id")
-                logger.info(
-                    "Reusing failed ingestion request %s for retry",
-                    request_id
-                )
+                await _reject_if_too_large(repository_service, repo_url)
+                reused = await job_queue.prepare_retry(request_id)
+                if not reused:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail="Failed ingestion request could not be requeued",
+                    )
+                logger.info("Reusing failed ingestion request %s for retry", request_id)
             else:
                 # Should not reach here, but handle gracefully
                 raise HTTPException(
@@ -643,6 +664,8 @@ async def ingest_repository(
                     },
                 )
 
+            await _reject_if_too_large(repository_service, repo_url)
+
             # Create new ingestion request
             request_data = {
                 "owner": owner,
@@ -673,15 +696,6 @@ async def ingest_repository(
             request_id = str(request_object_id)
             repo_id = str(existing_repo.get("_id")) if existing_repo else None
 
-        # Add background task
-        background_tasks.add_task(
-            ingestion_service.ingest_repository,
-            repo_url=repo_url,
-            branch=branch,
-            cleanup=request.cleanup,
-            request_id=request_id,
-        )
-
         logger.info(
             "Created/reused ingestion request %s for repository %s/%s (%s)",
             request_id, owner, repo_name, branch,
@@ -708,7 +722,8 @@ async def ingest_repository(
 
     except HTTPException:
         raise
-
+    except AppError:
+        raise
     except Exception as exc:
         logger.error(
             "Unexpected error during ingestion request creation: %s",
@@ -805,9 +820,8 @@ async def get_ingestion_status(
 )
 async def retry_ingestion(
     request_id: str,
-    background_tasks: BackgroundTasks,
     mongodb_service: MongoDBService = Depends(get_mongodb_service),
-    ingestion_service: IngestionService = Depends(get_ingestion_service),
+    job_queue: JobQueue = Depends(get_job_queue),
 ) -> IngestionResponse:
     """
     Retry a failed ingestion request.
@@ -895,29 +909,12 @@ async def retry_ingestion(
                 }
             )
 
-        # Increment retry count
-        await mongodb_service.increment_retry_count(request_id)
-
-        # Reset status to pending and clear error
-        await mongodb_service.update_ingestion_request_status(
-            request_id=request_id,
-            status=IngestionStatus.PENDING.value,
-            error=None,  # Clear previous error
-            message="Retrying ingestion..."
-        )
-
-        cleanup = ingestion_request.get("cleanup")
-        if cleanup is None:
-            cleanup = True
-
-        # Add background task for ingestion
-        background_tasks.add_task(
-            ingestion_service.ingest_repository,
-            repo_url=repo_url,
-            branch=branch,
-            cleanup=cleanup,
-            request_id=request_id
-        )
+        requeued = await job_queue.prepare_retry(request_id)
+        if not requeued:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Ingestion request could not be requeued",
+            )
 
         logger.info("Retrying ingestion request: %s for repository: %s", request_id, repo_url)
 
@@ -950,6 +947,8 @@ async def retry_ingestion(
 
     except HTTPException:
         raise
+    except AppError:
+        raise
     except Exception as e:
         logger.error("Error retrying ingestion for %s: %s", request_id, e, exc_info=True)
         raise HTTPException(
@@ -961,18 +960,15 @@ async def retry_ingestion(
 @router.post(
     "/ingest/{request_id}/cancel",
     response_model=IngestionStatusResponse,
-    summary="Cancel a pending ingestion",
-    description=(
-        "Cancel a pending ingestion job. Processing jobs cannot be cancelled "
-        "until the in-process worker is running."
-    ),
+    summary="Cancel a pending or processing ingestion",
+    description="Cancel a pending or processing ingestion job.",
 )
 async def cancel_ingestion(
     request_id: str,
     mongodb_service: MongoDBService = Depends(get_mongodb_service),
     job_queue: JobQueue = Depends(get_job_queue),
 ) -> IngestionStatusResponse:
-    """Cancel a pending ingestion request."""
+    """Cancel a pending or processing ingestion request."""
     try:
         ingestion_request = await mongodb_service.get_ingestion_request(request_id)
         if not ingestion_request:
@@ -981,31 +977,14 @@ async def cancel_ingestion(
                 detail=f"Ingestion request not found: {request_id}",
             )
 
-        current_status = ingestion_request.get("status")
-        if current_status == IngestionStatus.PENDING.value or current_status == "pending":
-            cancelled = await job_queue.cancel_pending(request_id)
-            if not cancelled:
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail={
-                        "error": "conflict",
-                        "message": "Ingestion request is no longer pending",
-                        "request_id": request_id,
-                    },
-                )
+        cancelled = await job_queue.cancel(request_id)
+        if cancelled:
+            repo_id = cancelled.get("repo_id")
+            if repo_id:
+                await mongodb_service.release_repo_if_processing(str(repo_id))
             return _ingestion_status_response(cancelled)
 
-        if current_status == IngestionStatus.PROCESSING.value or current_status == "processing":
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail={
-                    "error": "conflict",
-                    "message": "Cannot cancel a job that is currently processing",
-                    "request_id": request_id,
-                    "status": current_status,
-                },
-            )
-
+        current_status = ingestion_request.get("status")
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={
@@ -1016,6 +995,8 @@ async def cancel_ingestion(
             },
         )
     except HTTPException:
+        raise
+    except AppError:
         raise
     except Exception as e:
         logger.error("Error cancelling ingestion %s: %s", request_id, e, exc_info=True)

@@ -1,6 +1,6 @@
 """Atomic claim, heartbeat, progress, and cancel for csIngestionRequests."""
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Union
 
 from bson import ObjectId
@@ -10,8 +10,12 @@ LEASE_SECONDS = 60
 MAX_CLAIM_COUNT = 3
 
 
+class JobCancelled(Exception):
+    """Raised when ingest should stop because the job row is cancelled."""
+
+
 def _now() -> datetime:
-    return datetime.now()
+    return datetime.now(timezone.utc)
 
 
 def _to_object_id(value: Union[str, ObjectId]) -> ObjectId:
@@ -55,20 +59,22 @@ class JobQueue:
         expires_at = claimed_at + timedelta(seconds=LEASE_SECONDS)
         doc = await self._jobs.find_one_and_update(
             _claim_filter(claimed_at),
-            {
-                "$set": {
-                    "status": "processing",
-                    "lease": {
-                        "worker_id": worker_id,
-                        "heartbeat_at": claimed_at,
-                        "expires_at": expires_at,
-                    },
-                    "started_at": claimed_at,
-                    "updated_at": claimed_at,
-                    "message": "Processing repository...",
-                },
-                "$inc": {"claim_count": 1},
-            },
+            [
+                {
+                    "$set": {
+                        "status": "processing",
+                        "lease": {
+                            "worker_id": worker_id,
+                            "heartbeat_at": claimed_at,
+                            "expires_at": expires_at,
+                        },
+                        "claim_count": {"$add": [{"$ifNull": ["$claim_count", 0]}, 1]},
+                        "started_at": {"$ifNull": ["$started_at", claimed_at]},
+                        "updated_at": claimed_at,
+                        "message": "Processing repository...",
+                    }
+                }
+            ],
             sort=[("created_at", 1)],
             return_document=ReturnDocument.AFTER,
         )
@@ -129,7 +135,7 @@ class JobQueue:
         message: Optional[str] = None,
         now: Optional[datetime] = None,
     ) -> bool:
-        """Write progress fields that the caller actually has."""
+        """Write progress fields on an active job. No-ops if cancelled."""
         try:
             job_id = _to_object_id(request_id)
         except ValueError:
@@ -149,7 +155,23 @@ class JobQueue:
         if message is not None:
             fields["message"] = message
 
-        result = await self._jobs.update_one({"_id": job_id}, {"$set": fields})
+        result = await self._jobs.update_one(
+            {"_id": job_id, "status": "processing"},
+            {"$set": fields},
+        )
+        return result.matched_count > 0
+
+    async def set_repo_id(self, request_id: str, repo_id: str) -> bool:
+        """Link the job to a repository while it is still processing."""
+        try:
+            job_id = _to_object_id(request_id)
+            repo_oid = _to_object_id(repo_id)
+        except ValueError:
+            return False
+        result = await self._jobs.update_one(
+            {"_id": job_id, "status": "processing"},
+            {"$set": {"repo_id": repo_oid, "updated_at": _now()}},
+        )
         return result.matched_count > 0
 
     async def complete(
@@ -159,7 +181,7 @@ class JobQueue:
         message: Optional[str] = None,
         now: Optional[datetime] = None,
     ) -> bool:
-        """Mark a job completed and drop the lease."""
+        """Mark a processing job completed and drop the lease."""
         return await self._finish(
             request_id,
             status="completed",
@@ -175,7 +197,7 @@ class JobQueue:
         message: Optional[str] = None,
         now: Optional[datetime] = None,
     ) -> bool:
-        """Mark a job failed and drop the lease."""
+        """Mark a processing job failed and drop the lease."""
         return await self._finish(
             request_id,
             status="failed",
@@ -184,13 +206,13 @@ class JobQueue:
             now=now,
         )
 
-    async def cancel_pending(
+    async def cancel(
         self,
         request_id: str,
         *,
         now: Optional[datetime] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Cancel a pending job. Returns None if it was not pending."""
+        """Cancel a pending or processing job. Returns None if it was already terminal."""
         cancelled_at = now or _now()
         try:
             job_id = _to_object_id(request_id)
@@ -198,14 +220,52 @@ class JobQueue:
             return None
 
         doc = await self._jobs.find_one_and_update(
-            {"_id": job_id, "status": "pending"},
+            {"_id": job_id, "status": {"$in": ["pending", "processing"]}},
             {
                 "$set": {
                     "status": "cancelled",
                     "completed_at": cancelled_at,
                     "updated_at": cancelled_at,
                     "message": "Cancelled",
+                    "lease": None,
                 }
+            },
+            return_document=ReturnDocument.AFTER,
+        )
+        if not doc:
+            return None
+        return _public_doc(doc)
+
+    async def is_cancelled(self, request_id: str) -> bool:
+        """Return True if the job exists and is cancelled."""
+        try:
+            job_id = _to_object_id(request_id)
+        except ValueError:
+            return False
+        doc = await self._jobs.find_one({"_id": job_id}, {"status": 1})
+        return bool(doc and doc.get("status") == "cancelled")
+
+    async def prepare_retry(self, request_id: str) -> Optional[Dict[str, Any]]:
+        """Requeue a failed job as pending with a fresh claim_count."""
+        now = _now()
+        try:
+            job_id = _to_object_id(request_id)
+        except ValueError:
+            return None
+        doc = await self._jobs.find_one_and_update(
+            {"_id": job_id, "status": "failed"},
+            {
+                "$set": {
+                    "status": "pending",
+                    "claim_count": 0,
+                    "trigger": "retry",
+                    "progress.stage": "queued",
+                    "lease": None,
+                    "message": "Retrying ingestion...",
+                    "updated_at": now,
+                },
+                "$inc": {"retry_count": 1},
+                "$unset": {"error": "", "completed_at": "", "started_at": ""},
             },
             return_document=ReturnDocument.AFTER,
         )
@@ -245,5 +305,8 @@ class JobQueue:
         if unset:
             update["$unset"] = unset
 
-        result = await self._jobs.update_one({"_id": job_id}, update)
+        result = await self._jobs.update_one(
+            {"_id": job_id, "status": "processing"},
+            update,
+        )
         return result.matched_count > 0

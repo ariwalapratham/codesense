@@ -30,6 +30,11 @@ class Settings(BaseSettings):
     qdrant_api_key: Optional[str] = None
     qdrant_collection: str = "codesense_chunks"
 
+    # Ingest size limits (checked before clone / while walking files)
+    max_repo_size_mb: int = Field(default=50, ge=1)
+    max_file_size_kb: int = Field(default=256, ge=1)
+    ingestion_worker_enabled: bool = True
+
     # Optional Configuration
     github_token: Optional[str] = None
     gitlab_token: Optional[str] = None

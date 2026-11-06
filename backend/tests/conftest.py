@@ -14,6 +14,7 @@ os.environ["DB_NAME"] = "codesense_test"
 os.environ["GEMINI_API_KEY"] = ""
 os.environ["QDRANT_URL"] = ""
 os.environ["QDRANT_API_KEY"] = ""
+os.environ["INGESTION_WORKER_ENABLED"] = "false"
 
 
 @pytest.fixture(scope="session")

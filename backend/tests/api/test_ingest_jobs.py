@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from uuid import uuid4
 
 from bson import ObjectId
@@ -15,7 +15,7 @@ def _collection():
 
 
 def _insert_job(coll, **fields):
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
     doc = {
         "owner": _OWNER,
         "repo_name": "repo",
@@ -92,17 +92,17 @@ def test_cancel_pending_job(client):
         mongo_client.close()
 
 
-def test_cancel_processing_job_returns_conflict(client):
+def test_cancel_processing_job(client):
     mongo_client, coll = _collection()
     request_id = None
     try:
         request_id = _insert_job(coll, status="processing")
         response = client.post(f"/repository/ingest/{request_id}/cancel")
-        assert response.status_code == 409
-        error = response.json()["error"]
-        assert error["code"] == "conflict"
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "cancelled"
         stored = coll.find_one({"_id": ObjectId(request_id)})
-        assert stored["status"] == "processing"
+        assert stored["status"] == "cancelled"
     finally:
         if request_id:
             coll.delete_one({"_id": ObjectId(request_id)})

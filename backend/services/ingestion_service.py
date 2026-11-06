@@ -3,7 +3,7 @@
 import asyncio
 import logging
 import shutil
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
@@ -19,6 +19,7 @@ from schemas import ChunkMetadata, ParsingStats
 from services.embedding_service import EmbeddingService
 from services.embeddings.base import EMBEDDING_DIM, Embedder
 from services.embeddings.hashing import content_hash
+from services.jobs.queue import JobCancelled, JobQueue
 from services.mongodb_service import MongoDBService
 from services.parser_service import ParserService
 from services.repository_service import RepositoryService
@@ -106,7 +107,7 @@ async def reuse_or_embed(
                 raise RuntimeError("Embedder returned an empty vector")
             hash_to_vector[digest] = vector
 
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
     model_name = getattr(embedder, "model_name", None)
     for chunk in chunks:
         vector = hash_to_vector.get(chunk["content_hash"])
@@ -177,7 +178,13 @@ async def index_chunks(
 class IngestionService:
     """Service to orchestrate repository ingestion pipeline."""
 
-    def __init__(self, *, embedder: Embedder, vector_store: VectorStore):
+    def __init__(
+        self,
+        *,
+        embedder: Embedder,
+        vector_store: VectorStore,
+        job_queue: Optional[JobQueue] = None,
+    ):
         """Inject the process Embedder and VectorStore. Chunking stays on EmbeddingService."""
         self.temp_repos_path = Path(settings.temp_repos_path)
         self.temp_repos_path.mkdir(exist_ok=True, parents=True)
@@ -186,6 +193,23 @@ class IngestionService:
         self.embedder = embedder
         self.vector_store = vector_store
         self.mongodb_service = MongoDBService()
+        self.job_queue = job_queue
+
+    async def _ensure_active(self, request_id: Optional[str]) -> None:
+        """Raise JobCancelled if the job row was cancelled."""
+        if request_id and self.job_queue and await self.job_queue.is_cancelled(request_id):
+            raise JobCancelled()
+
+    async def _progress(self, request_id: Optional[str], **kwargs) -> None:
+        """Write progress, aborting if the job was cancelled."""
+        await self._ensure_active(request_id)
+        if request_id and self.job_queue:
+            await self.job_queue.set_progress(request_id, **kwargs)
+
+    @staticmethod
+    def _checkout_commit_sync(repo_path: Path, commit: str) -> None:
+        """Check out a specific commit in a cloned repo."""
+        Repo(repo_path).git.checkout(commit)
 
     @staticmethod
     def _extract_repo_info(repo_url: str) -> Tuple[str, str]:
@@ -271,6 +295,7 @@ class IngestionService:
         try:
             # Run file discovery in executor to avoid blocking
             loop = asyncio.get_event_loop()
+            max_bytes = settings.max_file_size_kb * 1024
             code_files = await loop.run_in_executor(
                 None,
                 lambda: [
@@ -279,6 +304,7 @@ class IngestionService:
                     if file_path.is_file()
                     and not any(skip_dir in file_path.parts for skip_dir in skip_dirs)
                     and file_path.suffix.lower() in supported_extensions
+                    and file_path.stat().st_size <= max_bytes
                 ]
             )
 
@@ -391,7 +417,7 @@ class IngestionService:
             "chunks_count": chunks_count,
             "chunks_with_embeddings": chunks_with_embeddings,
             "parsing_stats": ParsingStats(**parsing_stats).model_dump() if parsing_stats else None,
-            "last_ingested_at": datetime.now(),
+            "last_ingested_at": datetime.now(timezone.utc),
             "visibility": "public",
             "embedding_model": getattr(self.embedder, "model_name", settings.gemini_embedding_model),
             "embedding_dim": getattr(self.embedder, "dim", EMBEDDING_DIM),
@@ -622,7 +648,8 @@ class IngestionService:
         repo_url: str,
         branch: Optional[str] = None,
         cleanup: bool = True,
-        request_id: Optional[str] = None
+        request_id: Optional[str] = None,
+        target_commit: Optional[str] = None,
     ) -> Tuple[bool, str]:
         """
         Orchestrate the complete ingestion pipeline for a repository.
@@ -634,6 +661,7 @@ class IngestionService:
             branch: Specific branch to clone (optional)
             cleanup: Whether to cleanup temporary repository after processing
             request_id: Optional ingestion request ID for status tracking
+            target_commit: Optional 7-char commit the job should check out
 
         Returns:
             Tuple of (success: bool, message: str)
@@ -644,16 +672,8 @@ class IngestionService:
         try:
             logger.info("Starting ingestion pipeline for repository: %s (branch: %s, request_id: %s)",
                 repo_url, branch, request_id)
+            await self._ensure_active(request_id)
 
-            # Update status to processing
-            if request_id:
-                await self.mongodb_service.update_ingestion_request_status(
-                    request_id=request_id,
-                    status="processing",
-                    message="Processing repository..."
-                )
-
-            # Step 1: Extract repository information and resolve default branch
             try:
                 owner, repo_name = self._extract_repo_info(repo_url)
                 branch = await resolve_github_default_branch(repo_url, branch)
@@ -662,20 +682,14 @@ class IngestionService:
             except ValueError as e:
                 error_msg = f"Failed to extract repository information: {e}"
                 logger.error("%s", error_msg)
-                if request_id:
-                    await self.mongodb_service.update_ingestion_request_status(
-                        request_id=request_id,
-                        status="failed",
-                        error=error_msg
-                    )
                 return False, error_msg
 
-            # Step 2: Prepare temporary repository path (initially without commit hash)
             repo_path = self._prepare_temp_repo_path(repo_name)
             logger.info("Temporary repository path: %s", repo_path)
 
-            # Step 3: Clone repository (run in executor as it's blocking)
-            logger.info("Cloning repository...")
+            await self._progress(
+                request_id, stage="fetching", message="Cloning repository..."
+            )
             loop = asyncio.get_event_loop()
             success, message, _repo = await loop.run_in_executor(
                 None,
@@ -689,15 +703,21 @@ class IngestionService:
             if not success:
                 error_msg = f"Failed to clone repository: {message}"
                 logger.error("%s", error_msg)
-                if request_id:
-                    await self.mongodb_service.update_ingestion_request_status(
-                        request_id=request_id,
-                        status="failed",
-                        error=error_msg
-                    )
                 return False, error_msg
 
+            if target_commit:
+                try:
+                    await loop.run_in_executor(
+                        None,
+                        lambda: self._checkout_commit_sync(repo_path, target_commit),
+                    )
+                except Exception as exc:
+                    error_msg = f"Failed to check out commit {target_commit}: {exc}"
+                    logger.error("%s", error_msg)
+                    return False, error_msg
+
             logger.info("Repository cloned successfully: %s", message)
+            await self._ensure_active(request_id)
 
             # Step 4: Get commit hash and update repo path if needed
             commit_hash = await self._get_commit_hash(repo_path)
@@ -720,43 +740,33 @@ class IngestionService:
                     except OSError as e:
                         logger.warning("Failed to rename temp repo path: %s", e)
 
-            # Step 5: Discover code files
             logger.info("Discovering code files...")
             code_files = await self._discover_code_files(repo_path)
 
             if not code_files:
                 error_msg = "No code files found in repository"
                 logger.warning("%s", error_msg)
-                if request_id:
-                    await self.mongodb_service.update_ingestion_request_status(
-                        request_id=request_id,
-                        status="failed",
-                        error=error_msg
-                    )
                 if cleanup:
                     await self._cleanup_temp_repo(repo_path)
                 return False, error_msg
 
             logger.info("Found %d code files to process", len(code_files))
-
-            # Step 6: Parse files
-            logger.info("Parsing code files...")
+            await self._progress(
+                request_id,
+                stage="parsing",
+                files_total=len(code_files),
+                files_done=0,
+                message="Parsing code files...",
+            )
             parsed_structures = await self._parse_files(code_files, repo_path)
 
             if not parsed_structures:
                 error_msg = "Failed to parse any files"
                 logger.error(error_msg)
-                if request_id:
-                    await self.mongodb_service.update_ingestion_request_status(
-                        request_id=request_id,
-                        status="failed",
-                        error=error_msg
-                    )
                 if cleanup:
                     await self._cleanup_temp_repo(repo_path)
                 return False, error_msg
 
-            # Calculate parsing statistics
             total_functions = sum(len(s.get("functions", [])) for s in parsed_structures)
             total_classes = sum(len(s.get("classes", [])) for s in parsed_structures)
             total_imports = sum(len(s.get("imports", [])) for s in parsed_structures)
@@ -769,30 +779,30 @@ class IngestionService:
                 "total_imports": total_imports,
                 "languages": languages_found
             }
-
-            logger.info(
-                "Parsing complete: %d files, %d functions, %d classes, %d imports",
-                len(parsed_structures), total_functions, total_classes, total_imports
+            await self._progress(
+                request_id,
+                stage="chunking",
+                files_done=len(parsed_structures),
+                message="Chunking code...",
             )
 
-            # Step 7: Chunk code (embed later with hash reuse)
-            logger.info("Chunking code...")
             chunks = self.embedding_service.chunk_code(parsed_structures)
 
             if not chunks:
                 error_msg = "Failed to chunk code"
                 logger.error(error_msg)
-                if request_id:
-                    await self.mongodb_service.update_ingestion_request_status(
-                        request_id=request_id,
-                        status="failed",
-                        error=error_msg
-                    )
                 if cleanup:
                     await self._cleanup_temp_repo(repo_path)
                 return False, error_msg
 
             logger.info("Created %d chunks", len(chunks))
+            await self._progress(
+                request_id,
+                stage="embedding",
+                chunks_total=len(chunks),
+                chunks_embedded=0,
+                message="Embedding chunks...",
+            )
 
             logger.info("Indexing chunks in Qdrant and MongoDB...")
             try:
@@ -814,12 +824,6 @@ class IngestionService:
                         f"Error: {e}"
                     )
                     logger.error(error_msg)
-                    if request_id:
-                        await self.mongodb_service.update_ingestion_request_status(
-                            request_id=request_id,
-                            status="failed",
-                            error=error_msg
-                        )
                     if cleanup:
                         await self._cleanup_temp_repo(repo_path)
                     return False, error_msg
@@ -828,25 +832,19 @@ class IngestionService:
             if not store_success:
                 error_msg = "Failed to store embeddings"
                 logger.error(error_msg)
-                if request_id:
-                    await self.mongodb_service.update_ingestion_request_status(
-                        request_id=request_id,
-                        status="failed",
-                        error=error_msg
-                    )
                 if cleanup:
                     await self._cleanup_temp_repo(repo_path)
                 return False, error_msg
 
-            # Link repository ID to ingestion request
-            if request_id and repo_object_id:
-                await self.mongodb_service.update_ingestion_request_status(
-                    request_id=request_id,
-                    status="processing",
-                    repo_id=str(repo_object_id)
-                )
+            await self._progress(
+                request_id,
+                stage="finalizing",
+                chunks_embedded=len(chunks),
+                message="Finalizing...",
+            )
+            if request_id and repo_object_id and self.job_queue:
+                await self.job_queue.set_repo_id(request_id, str(repo_object_id))
 
-            # Step 10: Cleanup temporary repository
             if cleanup:
                 logger.info("Cleaning up temporary repository...")
                 await self._cleanup_temp_repo(repo_path)
@@ -856,33 +854,15 @@ class IngestionService:
                 f"Processed {len(code_files)} files and created {len(chunks)} chunks."
             )
             logger.info(success_msg)
-
-            # Update status to completed
-            if request_id:
-                await self.mongodb_service.update_ingestion_request_status(
-                    request_id=request_id,
-                    status="completed",
-                    message=success_msg
-                )
-
             return True, success_msg
 
-        # Top-level orchestration method needs broad exception handling
-        # to ensure cleanup and proper error reporting
+        except JobCancelled:
+            if cleanup and repo_path:
+                await self._cleanup_temp_repo(repo_path)
+            raise
         except (OSError, ValueError, KeyError, RuntimeError, AttributeError) as e:
             error_msg = f"Unexpected error during ingestion: {e}"
             logger.error(error_msg, exc_info=True)
-
-            # Update status to failed
-            if request_id:
-                await self.mongodb_service.update_ingestion_request_status(
-                    request_id=request_id,
-                    status="failed",
-                    error=error_msg
-                )
-
-            # Cleanup on error
             if cleanup and repo_path:
                 await self._cleanup_temp_repo(repo_path)
-
             return False, error_msg
