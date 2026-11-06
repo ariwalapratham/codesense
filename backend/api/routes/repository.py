@@ -11,6 +11,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, s
 
 from api.deps import (
     get_ingestion_service,
+    get_job_queue,
     get_mongodb_service,
     get_repository_service,
 )
@@ -27,6 +28,7 @@ from models.schemas import (
 )
 from schemas import IngestionStatus
 from services.ingestion_service import IngestionService
+from services.jobs.queue import JobQueue
 from services.mongodb_service import MongoDBService
 from services.repository_service import RepositoryService
 
@@ -36,6 +38,47 @@ router = APIRouter(
     prefix="/repository",
     tags=["repository"],
 )
+
+
+def _progress_from_doc(doc: Dict) -> Dict:
+    """Build the status progress object, defaulting missing counters to zero."""
+    progress = doc.get("progress") or {}
+    return {
+        "stage": progress.get("stage") or "queued",
+        "files_total": progress.get("files_total") or 0,
+        "files_done": progress.get("files_done") or 0,
+        "chunks_total": progress.get("chunks_total") or 0,
+        "chunks_embedded": progress.get("chunks_embedded") or 0,
+    }
+
+
+def _ingestion_status_response(
+    doc: Dict,
+    *,
+    commit_hash: Optional[str] = None,
+) -> IngestionStatusResponse:
+    """Map a csIngestionRequests document to the status response."""
+    repo_id = doc.get("repo_id")
+    if repo_id:
+        repo_id = str(repo_id)
+    return IngestionStatusResponse(
+        request_id=str(doc.get("id")),
+        repo_id=repo_id,
+        owner=doc.get("owner"),
+        repo_name=doc.get("repo_name"),
+        branch=doc.get("branch"),
+        commit_hash=commit_hash,
+        type=doc.get("type") or "full",
+        status=doc.get("status"),
+        error=doc.get("error"),
+        retry_count=doc.get("retry_count", 0),
+        retry_after=doc.get("retry_after"),
+        message=doc.get("message") or "Ingestion in progress",
+        progress=_progress_from_doc(doc),
+        created_at=doc.get("created_at"),
+        started_at=doc.get("started_at"),
+        completed_at=doc.get("completed_at"),
+    )
 
 
 def encode_repo_identifier(owner: str, repo_name: str, branch: str) -> str:
@@ -526,7 +569,17 @@ async def ingest_repository(
                 "repository_url": repo_url,
                 "branch": branch,
                 "status": IngestionStatus.PENDING.value,
-                "expected_commit_hash": remote_commit_hash,  # Store expected commit
+                "target_commit": remote_commit_hash,
+                "cleanup": request.cleanup,
+                "type": "full",
+                "trigger": "user",
+                "progress": {
+                    "stage": "queued",
+                    "files_total": 0,
+                    "files_done": 0,
+                    "chunks_total": 0,
+                    "chunks_embedded": 0,
+                },
             }
 
             request_object_id = await mongodb_service.create_ingestion_request(request_data)
@@ -641,34 +694,14 @@ async def get_ingestion_status(
                 detail=f"Ingestion request not found: {identifier}"
             )
 
-        # Extract data
         repo_id = ingestion_request.get("repo_id")
-        if repo_id:
-            repo_id = str(repo_id)
-
-        # Get commit hash from repository if available
         commit_hash = None
         if repo_id:
-            repo = await mongodb_service.get_repository(repo_id)
+            repo = await mongodb_service.get_repository(str(repo_id))
             if repo:
                 commit_hash = repo.get("commit_hash")
 
-        return IngestionStatusResponse(
-            request_id=str(ingestion_request.get("id")),
-            repo_id=repo_id,
-            owner=ingestion_request.get("owner"),
-            repo_name=ingestion_request.get("repo_name"),
-            branch=ingestion_request.get("branch"),
-            commit_hash=commit_hash,
-            status=ingestion_request.get("status"),
-            error=ingestion_request.get("error"),
-            retry_count=ingestion_request.get("retry_count", 0),
-            retry_after=ingestion_request.get("retry_after"),
-            message=ingestion_request.get("message") or "Ingestion in progress",
-            created_at=ingestion_request.get("created_at"),
-            started_at=ingestion_request.get("started_at"),
-            completed_at=ingestion_request.get("completed_at")
-        )
+        return _ingestion_status_response(ingestion_request, commit_hash=commit_hash)
 
     except HTTPException:
         raise
@@ -792,12 +825,16 @@ async def retry_ingestion(
             message="Retrying ingestion..."
         )
 
+        cleanup = ingestion_request.get("cleanup")
+        if cleanup is None:
+            cleanup = True
+
         # Add background task for ingestion
         background_tasks.add_task(
             ingestion_service.ingest_repository,
             repo_url=repo_url,
             branch=branch,
-            cleanup=True,  # Default cleanup
+            cleanup=cleanup,
             request_id=request_id
         )
 
@@ -837,4 +874,71 @@ async def retry_ingestion(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to retry ingestion: {str(e)}"
+        ) from e
+
+
+@router.post(
+    "/ingest/{request_id}/cancel",
+    response_model=IngestionStatusResponse,
+    summary="Cancel a pending ingestion",
+    description=(
+        "Cancel a pending ingestion job. Processing jobs cannot be cancelled "
+        "until the in-process worker is running."
+    ),
+)
+async def cancel_ingestion(
+    request_id: str,
+    mongodb_service: MongoDBService = Depends(get_mongodb_service),
+    job_queue: JobQueue = Depends(get_job_queue),
+) -> IngestionStatusResponse:
+    """Cancel a pending ingestion request."""
+    try:
+        ingestion_request = await mongodb_service.get_ingestion_request(request_id)
+        if not ingestion_request:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Ingestion request not found: {request_id}",
+            )
+
+        current_status = ingestion_request.get("status")
+        if current_status == IngestionStatus.PENDING.value or current_status == "pending":
+            cancelled = await job_queue.cancel_pending(request_id)
+            if not cancelled:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={
+                        "error": "conflict",
+                        "message": "Ingestion request is no longer pending",
+                        "request_id": request_id,
+                    },
+                )
+            return _ingestion_status_response(cancelled)
+
+        if current_status == IngestionStatus.PROCESSING.value or current_status == "processing":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "error": "conflict",
+                    "message": "Cannot cancel a job that is currently processing",
+                    "request_id": request_id,
+                    "status": current_status,
+                },
+            )
+
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error": "conflict",
+                "message": f"Cannot cancel a job with status: {current_status}",
+                "request_id": request_id,
+                "status": current_status,
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Error cancelling ingestion %s: %s", request_id, e, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to cancel ingestion: {str(e)}",
         ) from e

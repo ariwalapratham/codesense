@@ -54,6 +54,16 @@ class IngestionResponse(BaseModel):
         }
     )
 
+class IngestionProgressResponse(BaseModel):
+    """Stage and counts for an in-flight ingestion job."""
+
+    stage: str = Field(default="queued", description="queued, fetching, parsing, chunking, embedding, finalizing")
+    files_total: int = Field(default=0, ge=0)
+    files_done: int = Field(default=0, ge=0)
+    chunks_total: int = Field(default=0, ge=0)
+    chunks_embedded: int = Field(default=0, ge=0)
+
+
 class IngestionStatusResponse(BaseModel):
     """Response model for ingestion status query."""
 
@@ -63,6 +73,7 @@ class IngestionStatusResponse(BaseModel):
     repo_name: Optional[str] = Field(None, description="Repository name")
     branch: Optional[str] = Field(None, description="Repository branch")
     commit_hash: Optional[str] = Field(None, description="Repository commit hash")
+    type: str = Field(default="full", description="Job type")
     status: IngestionStatus = Field(..., description="Current request status")
     error: Optional[str] = Field(None, description="Error message if failed")
     retry_count: int = Field(..., description="Number of retry attempts")
@@ -70,6 +81,10 @@ class IngestionStatusResponse(BaseModel):
         None, description="Timestamp after which retry is allowed (for rate limiting)"
     )
     message: Optional[str] = Field(None, description="Status message")
+    progress: IngestionProgressResponse = Field(
+        default_factory=IngestionProgressResponse,
+        description="Pipeline stage and counts",
+    )
     created_at: datetime = Field(..., description="Request creation timestamp")
     started_at: Optional[datetime] = Field(None, description="When processing started")
     completed_at: Optional[datetime] = Field(None, description="When processing completed")
@@ -82,11 +97,19 @@ class IngestionStatusResponse(BaseModel):
                 "owner": "owner",
                 "repo_name": "repo",
                 "branch": "main",
+                "type": "full",
                 "status": "processing",
                 "error": None,
                 "retry_count": 0,
                 "retry_after": None,
-                "message": "Processing repository...",
+                "message": "Embedding chunks",
+                "progress": {
+                    "stage": "embedding",
+                    "files_total": 312,
+                    "files_done": 312,
+                    "chunks_total": 1480,
+                    "chunks_embedded": 640,
+                },
                 "created_at": "2024-01-01T10:00:00Z",
                 "started_at": "2024-01-01T10:00:05Z",
                 "completed_at": None,

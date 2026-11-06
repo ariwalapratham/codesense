@@ -346,6 +346,44 @@ class MongoDBService:
             )
             return False
 
+    async def fail_stale_streaming_messages(self, *, older_than_minutes: int = 10) -> int:
+        """Mark streaming chat messages older than the cutoff as failed."""
+        try:
+            cutoff = datetime.now() - timedelta(minutes=older_than_minutes)
+            now = datetime.now()
+            result = await self.chat_sessions.update_many(
+                {
+                    "messages": {
+                        "$elemMatch": {
+                            "status": "streaming",
+                            "timestamp": {"$lt": cutoff},
+                        }
+                    }
+                },
+                {
+                    "$set": {
+                        "messages.$[m].status": "failed",
+                        "updated_at": now,
+                    }
+                },
+                array_filters=[
+                    {"m.status": "streaming", "m.timestamp": {"$lt": cutoff}},
+                ],
+            )
+            if result.modified_count:
+                logger.info(
+                    "Marked stale streaming messages as failed in %s session(s)",
+                    result.modified_count,
+                )
+            return result.modified_count
+        except Exception as e:  # pylint: disable=broad-except
+            logger.error(
+                "Failed to recover stale streaming messages: %s",
+                e,
+                exc_info=True,
+            )
+            return 0
+
     async def fetch_recent_chat_messages(
         self,
         repo_id: str,
@@ -1131,8 +1169,8 @@ class MongoDBService:
                 # Always set started_at when processing starts (handles both new and retry scenarios)
                 update_doc["$set"]["started_at"] = datetime.now()
 
-            # Set completed_at when status changes to completed or failed
-            if status in ("completed", "failed"):
+            # Set completed_at when status changes to completed, failed, or cancelled
+            if status in ("completed", "failed", "cancelled"):
                 update_doc["$set"]["completed_at"] = datetime.now()
 
             # Find request by ObjectId

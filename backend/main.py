@@ -15,6 +15,7 @@ from database.mongodb import mongodb
 from scripts.create_indexes import apply_indexes
 from services.chat_service import ChatService
 from services.ingestion_service import IngestionService
+from services.jobs.queue import JobQueue
 from services.mongodb_service import MongoDBService
 from services.repository_service import RepositoryService
 
@@ -28,6 +29,7 @@ async def lifespan(app: FastAPI):
     logger.info("Starting application...")
     logger.info("CORS origin: %s", settings.frontend_origin)
     app.state.mongodb_service = MongoDBService()
+    app.state.job_queue = JobQueue(app.state.mongodb_service.ingestion_requests)
     app.state.ingestion_service = IngestionService()
     app.state.repository_service = RepositoryService()
     app.state.chat_service = ChatService()
@@ -36,6 +38,13 @@ async def lifespan(app: FastAPI):
         await apply_indexes(mongodb.db, include_unique=True)
     except PyMongoError:
         logger.exception("Failed to ensure MongoDB indexes")
+    else:
+        recovered = await app.state.mongodb_service.fail_stale_streaming_messages()
+        if recovered:
+            logger.info(
+                "Recovered %s chat session(s) with stale streaming messages",
+                recovered,
+            )
 
     yield
 

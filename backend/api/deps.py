@@ -4,6 +4,7 @@ from fastapi import Request
 
 from services.chat_service import ChatService
 from services.ingestion_service import IngestionService
+from services.jobs.queue import JobQueue
 from services.mongodb_service import MongoDBService
 from services.repository_service import RepositoryService
 
@@ -26,3 +27,8 @@ def get_repository_service(request: Request) -> RepositoryService:
 def get_chat_service(request: Request) -> ChatService:
     """Return the shared chat service from application state."""
     return request.app.state.chat_service
+
+
+def get_job_queue(request: Request) -> JobQueue:
+    """Return the shared ingestion job queue from application state."""
+    return request.app.state.job_queue

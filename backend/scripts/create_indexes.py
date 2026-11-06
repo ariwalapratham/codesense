@@ -47,6 +47,18 @@ _NON_UNIQUE_INDEXES = {
             name="idx_ingestion_requests_status_created_at",
         ),
         IndexModel(
+            [("status", ASCENDING), ("lease.expires_at", ASCENDING)],
+            name="idx_ingestion_requests_status_lease_expires_at",
+        ),
+        IndexModel(
+            [
+                ("repo_id", ASCENDING),
+                ("branch", ASCENDING),
+                ("status", ASCENDING),
+            ],
+            name="idx_ingestion_requests_repo_id_branch_status",
+        ),
+        IndexModel(
             [
                 ("owner", ASCENDING),
                 ("repo_name", ASCENDING),
@@ -54,6 +66,14 @@ _NON_UNIQUE_INDEXES = {
                 ("status", ASCENDING),
             ],
             name="idx_ingestion_requests_owner_repo_branch_status",
+        ),
+        IndexModel(
+            [("completed_at", ASCENDING)],
+            name="ttl_ingestion_requests_completed_at",
+            expireAfterSeconds=30 * 24 * 60 * 60,
+            partialFilterExpression={
+                "status": {"$in": ["completed", "failed", "cancelled"]},
+            },
         ),
     ],
 }
