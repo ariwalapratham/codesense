@@ -165,7 +165,9 @@ async def test_claim_count_increments_and_trips_max(jobs):
 async def test_started_at_is_preserved_on_reclaim(jobs):
     collection, insert = jobs
     queue = JobQueue(collection)
+    await insert()
     first = await queue.claim(WORKER_A)
+    assert first is not None
     started_at = first["started_at"]
     await collection.update_one(
         {"_id": ObjectId(first["id"])},
