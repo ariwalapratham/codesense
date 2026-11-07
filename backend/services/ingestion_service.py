@@ -5,7 +5,7 @@ import logging
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 from bson import ObjectId
 
@@ -79,6 +79,7 @@ async def reuse_or_embed(
     repo_id: str,
     embedder: Embedder,
     hash_to_vector: Dict[str, List[float]],
+    ensure_active: Optional[Callable[[], Awaitable[None]]] = None,
 ) -> List[Dict]:
     """Assign content_hash/point_id and fill embeddings, embedding only unseen hashes."""
     missing_hashes: List[str] = []
@@ -95,6 +96,8 @@ async def reuse_or_embed(
             missing_texts.append(text)
 
     for i in range(0, len(missing_texts), EMBED_BATCH):
+        if ensure_active is not None:
+            await ensure_active()
         batch_texts = missing_texts[i : i + EMBED_BATCH]
         batch_hashes = missing_hashes[i : i + EMBED_BATCH]
         vectors = await embedder.embed(batch_texts)
@@ -106,6 +109,9 @@ async def reuse_or_embed(
             if not vector:
                 raise RuntimeError("Embedder returned an empty vector")
             hash_to_vector[digest] = vector
+
+    if ensure_active is not None:
+        await ensure_active()
 
     now = datetime.now(timezone.utc)
     model_name = getattr(embedder, "model_name", None)
@@ -159,12 +165,19 @@ async def index_chunks(
     hash_to_point: Dict[str, str],
     commit_hash: str,
     stale_point_ids: Sequence[str] = (),
+    ensure_active: Optional[Callable[[], Awaitable[None]]] = None,
 ) -> Tuple[List[Dict], int]:
     """Reuse vectors by content_hash, embed misses, upsert Qdrant. Returns (chunks, embedded_count)."""
     reused = await load_reused_vectors(vector_store, hash_to_point)
     filled = await reuse_or_embed(
-        chunks, repo_id=repo_id, embedder=embedder, hash_to_vector=reused
+        chunks,
+        repo_id=repo_id,
+        embedder=embedder,
+        hash_to_vector=reused,
+        ensure_active=ensure_active,
     )
+    if ensure_active is not None:
+        await ensure_active()
     points = chunks_to_points(filled, repo_id=repo_id, commit_hash=commit_hash)
     await vector_store.upsert(points)
     keep = {point.point_id for point in points}
@@ -472,9 +485,11 @@ class IngestionService:
         branch: Optional[str],
         commit_hash: Optional[str],
         files_processed: int,
-        parsing_stats: Optional[Dict]
+        parsing_stats: Optional[Dict],
+        request_id: Optional[str] = None,
     ) -> Tuple[bool, Optional[ObjectId]]:
         """Reuse hashes, write Qdrant, then persist chunk text in Mongo."""
+        repo_object_id = None
         try:
             seed = {
                 "owner": owner,
@@ -498,6 +513,10 @@ class IngestionService:
                 return False, None
 
             repo_id_str = str(repo_object_id)
+            if request_id and self.job_queue:
+                await self.job_queue.set_repo_id(request_id, repo_id_str)
+            await self._ensure_active(request_id)
+
             hash_to_point = await self.mongodb_service.list_embedded_hash_index(repo_id_str)
             stale_ids = await self.mongodb_service.list_chunk_point_ids(repo_id_str)
             filled, embedded_count = await index_chunks(
@@ -508,8 +527,10 @@ class IngestionService:
                 hash_to_point=hash_to_point,
                 commit_hash=commit_hash or "",
                 stale_point_ids=stale_ids,
+                ensure_active=lambda: self._ensure_active(request_id),
             )
 
+            await self._ensure_active(request_id)
             repo_data = self._prepare_repository_data(
                 owner=owner,
                 repo_name=repo_name,
@@ -542,6 +563,10 @@ class IngestionService:
             )
             return True, repo_object_id if isinstance(repo_object_id, ObjectId) else ObjectId(repo_object_id)
 
+        except JobCancelled:
+            if repo_object_id:
+                await self.mongodb_service.release_repo_if_processing(str(repo_object_id))
+            raise
         except RuntimeError:
             raise
         except Exception as e:
@@ -814,7 +839,8 @@ class IngestionService:
                     branch=branch,
                     commit_hash=commit_hash,
                     files_processed=len(code_files),
-                    parsing_stats=parsing_stats
+                    parsing_stats=parsing_stats,
+                    request_id=request_id,
                 )
             except RuntimeError as e:
                 if "quota exhausted" in str(e).lower():
@@ -842,8 +868,6 @@ class IngestionService:
                 chunks_embedded=len(chunks),
                 message="Finalizing...",
             )
-            if request_id and repo_object_id and self.job_queue:
-                await self.job_queue.set_repo_id(request_id, str(repo_object_id))
 
             if cleanup:
                 logger.info("Cleaning up temporary repository...")

@@ -6,6 +6,7 @@ from services.ingestion_service import (
     load_reused_vectors,
     reuse_or_embed,
 )
+from services.jobs.queue import JobCancelled
 from services.vector_store.memory import MemoryVectorStore
 
 
@@ -123,3 +124,57 @@ async def test_reuse_or_embed_rejects_short_batch():
         assert "vectors" in str(exc)
     else:
         raise AssertionError("expected RuntimeError")
+
+
+async def test_reuse_or_embed_stops_between_batches_on_cancel():
+    embedder = TrackingEmbedder()
+    checks = {"n": 0}
+
+    async def ensure_active():
+        checks["n"] += 1
+        if checks["n"] > 1:
+            raise JobCancelled()
+
+    chunks = [
+        _chunk(chunk_id=f"c{i}", text=f"def f{i}():\n    return {i}\n")
+        for i in range(6)
+    ]
+    try:
+        await reuse_or_embed(
+            chunks,
+            repo_id="r1",
+            embedder=embedder,
+            hash_to_vector={},
+            ensure_active=ensure_active,
+        )
+    except JobCancelled:
+        pass
+    else:
+        raise AssertionError("expected JobCancelled")
+    assert embedder.calls == 1
+    assert checks["n"] == 2
+
+
+async def test_index_chunks_does_not_upsert_after_cancel():
+    store = MemoryVectorStore()
+    embedder = TrackingEmbedder()
+
+    async def ensure_active():
+        raise JobCancelled()
+
+    try:
+        await index_chunks(
+            [_chunk(chunk_id="c1", text="x = 1\n")],
+            repo_id="r1",
+            embedder=embedder,
+            vector_store=store,
+            hash_to_point={},
+            commit_hash="abc1234",
+            ensure_active=ensure_active,
+        )
+    except JobCancelled:
+        pass
+    else:
+        raise AssertionError("expected JobCancelled")
+    assert store._points == {}
+    assert embedder.calls == 0
