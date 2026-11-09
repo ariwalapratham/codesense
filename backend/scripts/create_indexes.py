@@ -33,10 +33,9 @@ _DUPLICATE_MATCHES = {
     "csChatSessions": {"user_id": {"$type": "objectId"}},
 }
 
-# Drop obsolete repo unique only. Keep ux_chat_sessions_repo_id_session_id until Day 6b
-# writes user_id on create (partial user unique does not cover null user_id rows).
 _INDEXES_TO_DROP = {
     "csRepositories": ("ux_repositories_owner_repo_name",),
+    "csChatSessions": ("ux_chat_sessions_repo_id_session_id",),
 }
 
 _NON_UNIQUE_INDEXES = {
@@ -153,11 +152,6 @@ _UNIQUE_INDEXES = {
         ),
     ],
     "csChatSessions": [
-        IndexModel(
-            [("repo_id", ASCENDING), ("session_id", ASCENDING)],
-            name="ux_chat_sessions_repo_id_session_id",
-            unique=True,
-        ),
         IndexModel(
             [
                 ("user_id", ASCENDING),

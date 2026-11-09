@@ -18,14 +18,45 @@ def test_search_unknown_repo_returns_not_found(client, auth_headers):
     assert error["request_id"] == response.headers.get("x-request-id")
 
 
-def test_search_empty_query_returns_400(client, auth_headers):
-    response = client.get(
-        "/repository/507f1f77bcf86cd799439011/search",
-        params={"q": "   "},
-        headers=auth_headers,
-    )
-    assert response.status_code == 400
-    assert response.json()["error"]["code"] == "validation_error"
+def test_search_empty_query_returns_400(client, auth_headers, auth_user):
+    from datetime import datetime, timezone
+
+    from pymongo import MongoClient
+
+    from config.settings import settings
+
+    repo_id = ObjectId()
+    mongo = MongoClient(settings.mongodb_url, serverSelectionTimeoutMS=5000)
+    db = mongo[settings.db_name]
+    try:
+        db["csRepositories"].insert_one(
+            {
+                "_id": repo_id,
+                "owner": "acme",
+                "repo_name": "search-empty",
+                "repository_url": "https://github.com/acme/search-empty.git",
+                "branch": "main",
+                "status": "completed",
+                "owner_user_id": None,
+                "visibility": "public",
+                "created_at": datetime.now(timezone.utc),
+                "updated_at": datetime.now(timezone.utc),
+            }
+        )
+        db["csUserRepositories"].insert_one(
+            {"user_id": auth_user["_id"], "repo_id": repo_id, "role": "member"}
+        )
+        response = client.get(
+            f"/repository/{repo_id}/search",
+            params={"q": "   "},
+            headers=auth_headers,
+        )
+        assert response.status_code == 400
+        assert response.json()["error"]["code"] == "validation_error"
+    finally:
+        db["csUserRepositories"].delete_many({"repo_id": repo_id})
+        db["csRepositories"].delete_one({"_id": repo_id})
+        mongo.close()
 
 
 class _Cursor:

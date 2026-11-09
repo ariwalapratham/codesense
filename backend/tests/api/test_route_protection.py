@@ -15,6 +15,7 @@ _SESSION = "session-1"
         ("GET", f"/repository/{_REPO}/search?q=def"),
         ("DELETE", f"/repository/{_REPO}"),
         ("POST", "/repository/ingest"),
+        ("GET", "/repository/ingest/requests"),
         ("GET", "/repository/ingest/status/not-an-id"),
         ("POST", "/repository/ingest/507f1f77bcf86cd799439011/retry"),
         ("POST", "/repository/ingest/507f1f77bcf86cd799439011/cancel"),

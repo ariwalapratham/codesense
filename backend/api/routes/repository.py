@@ -7,21 +7,23 @@ from typing import Dict, Optional, Tuple
 from urllib.parse import urlparse
 
 from bson import ObjectId
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from pymongo.errors import PyMongoError
 
 from api.deps import (
     get_current_user,
-    get_ingestion_service,
     get_job_queue,
     get_mongodb_service,
     get_repository_service,
     get_retrieval_service,
+    require_repo_access,
 )
 from config.settings import settings
 from core.errors import AppError
 from models.schemas import (
     DeleteRepositoryResponse,
     IngestionRequest,
+    IngestionRequestListResponse,
     IngestionResponse,
     IngestionStatusResponse,
     ParsingStatsResponse,
@@ -33,7 +35,7 @@ from models.schemas import (
     SearchResponse,
 )
 from schemas import IngestionStatus
-from services.ingestion_service import IngestionService, resolve_github_default_branch
+from services.ingestion_service import resolve_github_default_branch
 from services.jobs.queue import JobQueue
 from services.mongodb_service import MongoDBService
 from services.repository_service import RepositoryService
@@ -49,6 +51,48 @@ router = APIRouter(
     tags=["repository"],
     dependencies=[Depends(get_current_user)],
 )
+
+
+def _job_owned_by(doc: Optional[Dict], user: dict) -> bool:
+    """True when the job's requested_by matches the caller."""
+    if not doc:
+        return False
+    requested_by = doc.get("requested_by")
+    if requested_by is None:
+        return False
+    return str(requested_by) == str(user["_id"])
+
+
+async def _link_library(mongodb_service: MongoDBService, user: dict, repo_id: Optional[str]) -> None:
+    """Attach the public repo to the caller's library when a repo_id exists."""
+    if not repo_id:
+        return
+    linked = await mongodb_service.upsert_library_link(user["_id"], repo_id)
+    if not linked:
+        raise AppError(
+            "Failed to add repository to library",
+            code="internal_error",
+            status_code=500,
+        )
+
+
+async def _can_view_ingest_job(
+    mongodb_service: MongoDBService, doc: Optional[Dict], user: dict
+) -> bool:
+    """Owner or a library member of the job's repo may read ingest status."""
+    if _job_owned_by(doc, user):
+        return True
+    repo_id = (doc or {}).get("repo_id")
+    if not repo_id:
+        return False
+    try:
+        return await mongodb_service.has_library_access(user["_id"], repo_id)
+    except PyMongoError as exc:
+        raise AppError(
+            "Library lookup unavailable",
+            code="upstream_error",
+            status_code=503,
+        ) from exc
 
 
 def _progress_from_doc(doc: Dict) -> Dict:
@@ -186,13 +230,14 @@ def _to_repository_summary(repo_dict: Dict) -> RepositorySummary:
     "/",
     response_model=RepositoryListResponse,
     summary="List repositories",
-    description="Get a paginated list of repositories with optional search.",
+    description="Get a paginated list of repositories in the caller's library.",
 )
 async def list_repositories(
     skip: int = Query(0, ge=0, description="Number of repositories to skip"),
     limit: int = Query(10, ge=1, le=100, description="Maximum number of repositories to return"),
     search: Optional[str] = Query(None, description="Search repo_name, owner, or repository_url"),
     mongodb_service: MongoDBService = Depends(get_mongodb_service),
+    user: dict = Depends(get_current_user),
 ) -> RepositoryListResponse:
     """
     List repositories with pagination and optional search.
@@ -210,6 +255,7 @@ async def list_repositories(
             skip=skip,
             limit=limit,
             search=search,
+            user_id=user["_id"],
         )
 
         repo_summaries = []
@@ -248,6 +294,41 @@ async def list_repositories(
 
 
 @router.get(
+    "/ingest/requests",
+    response_model=IngestionRequestListResponse,
+    summary="List my ingestion jobs",
+    description="Jobs the caller created, newest first.",
+)
+async def list_ingestion_requests(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=100),
+    mongodb_service: MongoDBService = Depends(get_mongodb_service),
+    user: dict = Depends(get_current_user),
+) -> IngestionRequestListResponse:
+    """Return the caller's ingestion jobs."""
+    try:
+        docs, total = await mongodb_service.list_ingestion_requests(
+            user["_id"], skip=skip, limit=limit
+        )
+        return IngestionRequestListResponse(
+            requests=[_ingestion_status_response(doc) for doc in docs],
+            total=total,
+            skip=skip,
+            limit=limit,
+        )
+    except HTTPException:
+        raise
+    except AppError:
+        raise
+    except Exception as exc:
+        logger.error("Error listing ingestion requests: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to list ingestion requests",
+        ) from exc
+
+
+@router.get(
     "/{repo_id}",
     response_model=RepositoryInfo,
     summary="Get repository by ID",
@@ -256,6 +337,7 @@ async def list_repositories(
 async def get_repository(
     repo_id: str,
     mongodb_service: MongoDBService = Depends(get_mongodb_service),
+    _user: dict = Depends(require_repo_access),
 ) -> RepositoryInfo:
     """
     Get detailed information about a repository.
@@ -303,6 +385,7 @@ async def get_repository(
 async def get_repository_stats(
     repo_id: str,
     mongodb_service: MongoDBService = Depends(get_mongodb_service),
+    _user: dict = Depends(require_repo_access),
 ) -> RepositoryStats:
     """
     Get repository statistics including chunk and language distributions.
@@ -349,6 +432,7 @@ async def search_repository(
     language: Optional[str] = Query(None),
     mongodb_service: MongoDBService = Depends(get_mongodb_service),
     retrieval_service: RetrievalService = Depends(get_retrieval_service),
+    _user: dict = Depends(require_repo_access),
 ) -> SearchResponse:
     query = q.strip()
     if not query:
@@ -404,47 +488,33 @@ async def search_repository(
 @router.delete(
     "/{repo_id}",
     response_model=DeleteRepositoryResponse,
-    summary="Delete repository",
-    description="Delete a repository and all its associated data (chunks, queries, vector store).",
+    summary="Remove repository from library",
+    description="Unlink the repo from the caller's library. Indexed data stays (public, shared).",
 )
 async def delete_repository(
     repo_id: str,
-    ingestion_service: IngestionService = Depends(get_ingestion_service),
+    mongodb_service: MongoDBService = Depends(get_mongodb_service),
+    user: dict = Depends(require_repo_access),
 ) -> DeleteRepositoryResponse:
-    """
-    Delete a repository and all its data.
-
-    Deletes:
-    - All code chunks
-    - All queries (if collection exists)
-    - Vector store files (FAISS index and mappings)
-    - Repository record
-
-    Args:
-        repo_id: Repository identifier (MongoDB ObjectId as string)
-
-    Returns:
-        DeleteRepositoryResponse with deletion status
-    """
+    """Remove the library row only. Chunks, vectors, and the repo document stay."""
     try:
-        success, message, details = await ingestion_service.delete_repository(repo_id)
-
-        if not success:
-            # Check if repository was not found
-            if "not found" in message.lower():
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail=message,
-                )
-            # For partial deletions, return 207 Multi-Status or 200 with details
-            # Using 200 with success=False to show partial failure
-            logger.warning("Partial deletion for repository %s: %s", repo_id, message)
-
-        logger.info("Delete repository operation completed for: %s", repo_id)
+        unlinked = await mongodb_service.unlink_library(user["_id"], repo_id)
+        if not unlinked:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Repository not found: {repo_id}",
+            )
+        logger.info("Unlinked repository %s from user library", repo_id)
         return DeleteRepositoryResponse(
-            success=success,
-            message=message,
-            details=details
+            success=True,
+            message="Removed from library",
+            details={
+                "unlinked": True,
+                "chunks_deleted": False,
+                "queries_deleted": False,
+                "vector_store_deleted": False,
+                "repository_deleted": False,
+            },
         )
 
     except HTTPException:
@@ -506,6 +576,7 @@ def _extract_repo_info(repo_url: str) -> tuple:
 )
 async def ingest_repository(
     request: IngestionRequest,
+    response: Response,
     mongodb_service: MongoDBService = Depends(get_mongodb_service),
     repository_service: RepositoryService = Depends(get_repository_service),
     job_queue: JobQueue = Depends(get_job_queue),
@@ -571,17 +642,17 @@ async def ingest_repository(
 
             if existing_commit == remote_commit_hash:
                 repo_id = str(existing_repo.get("_id"))
+                await _link_library(mongodb_service, user, repo_id)
 
                 logger.info(
                     "Repository %s/%s (%s) already exists with commit %s",
                     owner, repo_name, branch, remote_commit_hash
                 )
 
-                # Generate encoded identifier
                 encoded_id = encode_repo_identifier(owner, repo_name, branch)
-
+                response.status_code = status.HTTP_200_OK
                 return IngestionResponse(
-                    request_id=None,  # No new request created
+                    request_id=None,
                     encoded_id=encoded_id,
                     repo_id=repo_id,
                     owner=owner,
@@ -589,6 +660,7 @@ async def ingest_repository(
                     branch=branch,
                     commit_hash=remote_commit_hash,
                     status=IngestionStatus.COMPLETED,
+                    linked=True,
                     message=f"Repository already ingested with commit {remote_commit_hash[:7]}"
                 )
 
@@ -601,18 +673,23 @@ async def ingest_repository(
             branch=branch,
         )
 
+        reused_failed = False
         if active_request:
             active_status = active_request.get("status")
             active_request_id = active_request.get("id")
 
             # Block if actively processing OR pending (to prevent duplicate tasks)
             if active_status in [IngestionStatus.PROCESSING, IngestionStatus.PENDING]:
+                conflict_repo_id = active_request.get("repo_id") or (
+                    str(existing_repo["_id"]) if existing_repo else None
+                )
+                await _link_library(mongodb_service, user, conflict_repo_id)
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
                     detail={
                         "error": "Repository ingestion already in progress",
                         "request_id": active_request_id,
-                        "repo_id": active_request.get("repo_id"),
+                        "repo_id": conflict_repo_id,
                         "status": active_status,
                         "message": (
                             f"Repository {owner}/{repo_name} ({branch}) "
@@ -622,9 +699,15 @@ async def ingest_repository(
                     }
                 )
 
-            if active_status == IngestionStatus.FAILED:
+            # Only the job owner may reuse a failed request; others enqueue their own.
+            if (
+                active_status == IngestionStatus.FAILED
+                and _job_owned_by(active_request, user)
+            ):
                 request_id = active_request_id
                 repo_id = active_request.get("repo_id")
+                if repo_id:
+                    repo_id = str(repo_id)
                 await _reject_if_too_large(repository_service, repo_url)
                 reused = await job_queue.prepare_retry(request_id)
                 if not reused:
@@ -632,9 +715,10 @@ async def ingest_repository(
                         status_code=status.HTTP_409_CONFLICT,
                         detail="Failed ingestion request could not be requeued",
                     )
+                await _link_library(mongodb_service, user, repo_id)
+                reused_failed = True
                 logger.info("Reusing failed ingestion request %s for retry", request_id)
-            else:
-                # Should not reach here, but handle gracefully
+            elif active_status != IngestionStatus.FAILED:
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
                     detail={
@@ -642,8 +726,9 @@ async def ingest_repository(
                         "request_id": active_request_id,
                         "status": active_status
                     }
-            )
-        else:
+                )
+
+        if not reused_failed:
             # Rate limit check (only for new requests)
             allowed, retry_count, retry_after = await mongodb_service.check_retry_rate_limit(
                 owner=owner,
@@ -698,7 +783,29 @@ async def ingest_repository(
                 )
 
             request_id = str(request_object_id)
-            repo_id = str(existing_repo.get("_id")) if existing_repo else None
+            if existing_repo:
+                repo_id = str(existing_repo["_id"])
+            else:
+                stub_id = await mongodb_service.upsert_repository(
+                    {
+                        "owner": owner,
+                        "repo_name": repo_name,
+                        "repository_url": repo_url,
+                        "branch": branch,
+                        "commit_hash": remote_commit_hash,
+                        "status": "processing",
+                        "visibility": "public",
+                        "owner_user_id": None,
+                    }
+                )
+                repo_id = str(stub_id) if stub_id else None
+                if repo_id:
+                    await mongodb_service.update_ingestion_request_status(
+                        request_id,
+                        IngestionStatus.PENDING.value,
+                        repo_id=repo_id,
+                    )
+            await _link_library(mongodb_service, user, repo_id)
 
         logger.info(
             "Created/reused ingestion request %s for repository %s/%s (%s)",
@@ -718,9 +825,9 @@ async def ingest_repository(
             commit_hash=remote_commit_hash,
             status=IngestionStatus.PENDING,
             message=(
-                "Ingestion request created and queued"
-                if not active_request
-                else "Retrying ingestion"
+                "Retrying failed ingestion request"
+                if reused_failed
+                else "Ingestion request created and queued"
             )
         )
 
@@ -748,6 +855,7 @@ async def ingest_repository(
 async def get_ingestion_status(
     identifier: str,
     mongodb_service: MongoDBService = Depends(get_mongodb_service),
+    user: dict = Depends(get_current_user),
 ) -> IngestionStatusResponse:
     """
     Get ingestion status by identifier.
@@ -782,13 +890,15 @@ async def get_ingestion_status(
                 ingestion_request = await mongodb_service.get_ingestion_request_by_identifier(
                     owner=owner,
                     repo_name=repo_name,
-                    branch=branch
+                    branch=branch,
                 )
             except ValueError as e:
                 logger.debug("Failed to decode identifier as base64: %s", e)
                 # Continue to 404 below
 
-        if not ingestion_request:
+        if not ingestion_request or not await _can_view_ingest_job(
+            mongodb_service, ingestion_request, user
+        ):
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Ingestion request not found: {identifier}"
@@ -804,6 +914,8 @@ async def get_ingestion_status(
         return _ingestion_status_response(ingestion_request, commit_hash=commit_hash)
 
     except HTTPException:
+        raise
+    except AppError:
         raise
     except Exception as e:
         logger.error(
@@ -826,6 +938,7 @@ async def retry_ingestion(
     request_id: str,
     mongodb_service: MongoDBService = Depends(get_mongodb_service),
     job_queue: JobQueue = Depends(get_job_queue),
+    user: dict = Depends(get_current_user),
 ) -> IngestionResponse:
     """
     Retry a failed ingestion request.
@@ -844,7 +957,7 @@ async def retry_ingestion(
         # Get the ingestion request
         ingestion_request = await mongodb_service.get_ingestion_request(request_id)
 
-        if not ingestion_request:
+        if not ingestion_request or not _job_owned_by(ingestion_request, user):
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Ingestion request not found: {request_id}"
@@ -971,11 +1084,12 @@ async def cancel_ingestion(
     request_id: str,
     mongodb_service: MongoDBService = Depends(get_mongodb_service),
     job_queue: JobQueue = Depends(get_job_queue),
+    user: dict = Depends(get_current_user),
 ) -> IngestionStatusResponse:
     """Cancel a pending or processing ingestion request."""
     try:
         ingestion_request = await mongodb_service.get_ingestion_request(request_id)
-        if not ingestion_request:
+        if not ingestion_request or not _job_owned_by(ingestion_request, user):
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Ingestion request not found: {request_id}",

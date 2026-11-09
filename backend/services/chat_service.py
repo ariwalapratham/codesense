@@ -2,7 +2,9 @@
 
 import logging
 from datetime import datetime
-from typing import AsyncIterator, Dict, List, Optional, Sequence, Tuple
+from typing import AsyncIterator, Dict, List, Optional, Sequence, Tuple, Union
+
+from bson import ObjectId
 from uuid import uuid4
 
 from core.errors import AppError, code_for_status
@@ -55,6 +57,7 @@ class ChatService:
         session_id: str,
         user_message: str,
         stream: bool = False,
+        user_id: Optional[Union[str, ObjectId]] = None,
     ) -> Dict:
         """
         Process a user message and return the assistant response payload.
@@ -69,7 +72,9 @@ class ChatService:
         if not repo_doc:
             raise ChatServiceError("Repository not found.", status_code=404)
 
-        session_doc = await self.mongodb_service.get_chat_session(repo_id, session_id)
+        session_doc = await self.mongodb_service.get_chat_session(
+            repo_id, session_id, user_id=user_id
+        )
         if not session_doc:
             raise ChatServiceError("Chat session not found.", status_code=404)
 
@@ -80,6 +85,7 @@ class ChatService:
             role="user",
             content=user_message,
             status="completed",
+            user_id=user_id,
         )
         logger.info(
             "Processing chat message (repo=%s, session=%s, user_message_id=%s)",
@@ -160,6 +166,7 @@ class ChatService:
             references=references,
             chunks_used=chunk_ids_used,
             metadata=response_metadata,
+            user_id=user_id,
         )
 
         return {
@@ -174,6 +181,7 @@ class ChatService:
         repo_id: str,
         session_id: str,
         user_message: str,
+        user_id: Optional[Union[str, ObjectId]] = None,
     ) -> AsyncIterator[Dict]:
         """
         Process a user message and stream the assistant response token-by-token.
@@ -199,7 +207,9 @@ class ChatService:
                 }
                 return
 
-            session_doc = await self.mongodb_service.get_chat_session(repo_id, session_id)
+            session_doc = await self.mongodb_service.get_chat_session(
+                repo_id, session_id, user_id=user_id
+            )
             if not session_doc:
                 yield {
                     "type": "error",
@@ -214,6 +224,7 @@ class ChatService:
                 role="user",
                 content=user_message,
                 status="completed",
+                user_id=user_id,
             )
             logger.info(
                 "Processing streaming chat message (repo=%s, session=%s, user_message_id=%s)",
@@ -303,6 +314,7 @@ class ChatService:
                 references=references,
                 chunks_used=chunk_ids_used,
                 metadata=response_metadata,
+                user_id=user_id,
             )
 
             # 9. Send final metadata event
@@ -336,6 +348,7 @@ class ChatService:
         references: Optional[List[Dict]] = None,
         chunks_used: Optional[List[str]] = None,
         metadata: Optional[Dict] = None,
+        user_id: Optional[Union[str, ObjectId]] = None,
     ) -> str:
         """Persist a chat message and return its identifier."""
         message_id = str(uuid4())
@@ -353,6 +366,7 @@ class ChatService:
             repo_id=repo_id,
             session_id=session_id,
             message=message_payload,
+            user_id=user_id,
         )
         return message_id
 
@@ -412,6 +426,7 @@ class ChatService:
         self,
         repo_id: str,
         session_id: str,
+        user_id: Optional[Union[str, ObjectId]] = None,
     ) -> None:
         """
         Background task to generate/update conversation summary.
@@ -426,13 +441,18 @@ class ChatService:
                 session_id=session_id,
                 skip=0,
                 limit=1000,
+                user_id=user_id,
             )
 
             if not self.should_generate_summary(total):
                 return  # Not enough messages to summarize yet
 
             # Get existing summary and last_summarized_count
-            session_doc = await self.mongodb_service.get_chat_session(repo_id, session_id)
+            session_doc = await self.mongodb_service.get_chat_session(
+                repo_id, session_id, user_id=user_id
+            )
+            if not session_doc:
+                return
             existing_summary = session_doc.get("summary")
             last_summarized_count = session_doc.get("last_summarized_count", 0)
 
@@ -463,6 +483,7 @@ class ChatService:
                         "summary": new_summary,
                         "last_summarized_count": len(old_messages),
                     },
+                    user_id=user_id,
                 )
                 logger.info(
                     "Generated summary for session %s (repo=%s, %d old messages)",
@@ -497,6 +518,7 @@ class ChatService:
         repo_id: str,
         session_id: str,
         first_user_message: str,
+        user_id: Optional[Union[str, ObjectId]] = None,
     ) -> None:
         """
         Background task to generate a title for a new chat session.
@@ -505,8 +527,10 @@ class ChatService:
         """
         try:
             # Check if title is still default
-            session_doc = await self.mongodb_service.get_chat_session(repo_id, session_id)
-            current_title = session_doc.get("title")
+            session_doc = await self.mongodb_service.get_chat_session(
+                repo_id, session_id, user_id=user_id
+            )
+            current_title = session_doc.get("title") if session_doc else None
 
             # Only update if it's still "New Chat" or None
             if current_title and current_title.lower() not in ["new chat", "new", ""]:
@@ -520,6 +544,7 @@ class ChatService:
                     repo_id=repo_id,
                     session_id=session_id,
                     updates={"title": title},
+                    user_id=user_id,
                 )
                 logger.info("Generated title '%s' for session %s (repo=%s)",
                                 title, session_id, repo_id)

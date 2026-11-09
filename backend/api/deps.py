@@ -2,8 +2,10 @@
 
 from typing import Optional
 
+from bson import ObjectId
 from fastapi import Depends, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pymongo.errors import PyMongoError
 
 from core.errors import AppError
 from core.security import decode_access_token
@@ -90,4 +92,25 @@ async def get_current_user(
             code="unauthorized",
             status_code=401,
         )
+    return user
+
+
+async def require_repo_access(
+    repo_id: str,
+    user: dict = Depends(get_current_user),
+    mongodb_service: MongoDBService = Depends(get_mongodb_service),
+) -> dict:
+    """404 unless the caller has a library row for this repo. Never 403."""
+    if not ObjectId.is_valid(repo_id):
+        raise AppError("Repository not found", code="not_found", status_code=404)
+    try:
+        linked = await mongodb_service.has_library_access(user["_id"], repo_id)
+    except PyMongoError as exc:
+        raise AppError(
+            "Library lookup unavailable",
+            code="upstream_error",
+            status_code=503,
+        ) from exc
+    if not linked:
+        raise AppError("Repository not found", code="not_found", status_code=404)
     return user

@@ -55,17 +55,15 @@ def test_day6_repo_and_library_indexes():
         for model in models
     }
     assert "ux_repositories_owner_repo_name" not in unique
-    assert "ux_chat_sessions_repo_id_session_id" in unique
+    assert "ux_chat_sessions_repo_id_session_id" not in unique
     repo_ux = unique["ux_repositories_owner_repo_name_branch_owner_user_id"]
     assert repo_ux.get("unique") is True
     chat_ux = unique["ux_chat_sessions_user_id_repo_id_session_id"]
     assert chat_ux.get("unique") is True
     assert chat_ux.get("partialFilterExpression") == {"user_id": {"$type": "objectId"}}
     assert "ux_user_repositories_user_id_repo_id" in unique
-    assert _INDEXES_TO_DROP == {
-        "csRepositories": ("ux_repositories_owner_repo_name",),
-    }
-    assert "csChatSessions" not in _INDEXES_TO_DROP
+    assert _INDEXES_TO_DROP["csRepositories"] == ("ux_repositories_owner_repo_name",)
+    assert _INDEXES_TO_DROP["csChatSessions"] == ("ux_chat_sessions_repo_id_session_id",)
     assert ("csRepositories", ("owner", "repo_name", "branch", "owner_user_id")) in _DUPLICATE_CHECKS
     assert ("csChatSessions", ("user_id", "repo_id", "session_id")) in _DUPLICATE_CHECKS
     assert _DUPLICATE_MATCHES["csChatSessions"] == {"user_id": {"$type": "objectId"}}

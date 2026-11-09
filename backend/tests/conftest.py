@@ -35,33 +35,30 @@ def client():
         yield test_client
 
 
-@pytest.fixture(scope="session")
-def auth_headers(client):
-    """Bearer header for a persisted test user. Repository/chat routes require this."""
+def _upsert_test_user(github_id: int, login: str) -> dict:
     from datetime import datetime, timezone
 
     from bson import ObjectId
     from pymongo import MongoClient
 
     from config.settings import settings
-    from core.security import create_access_token
 
     now = datetime.now(timezone.utc)
     mongo = MongoClient(settings.mongodb_url, serverSelectionTimeoutMS=5000)
     try:
         users = mongo[settings.db_name]["csUsers"]
         users.update_one(
-            {"github_id": 900000001},
+            {"github_id": github_id},
             {
                 "$set": {
-                    "github_login": "pytest-auth-user",
+                    "github_login": login,
                     "status": "active",
                     "role": "user",
                     "last_login_at": now,
                 },
                 "$setOnInsert": {
                     "_id": ObjectId(),
-                    "github_id": 900000001,
+                    "github_id": github_id,
                     "created_at": now,
                     "quota_overrides": {
                         "repos": None,
@@ -72,8 +69,36 @@ def auth_headers(client):
             },
             upsert=True,
         )
-        doc = users.find_one({"github_id": 900000001})
-        token = create_access_token(user_id=str(doc["_id"]), role="user")
-        yield {"Authorization": f"Bearer {token}"}
+        return users.find_one({"github_id": github_id})
     finally:
         mongo.close()
+
+
+@pytest.fixture(scope="session")
+def auth_user(client):
+    """Persisted primary test user."""
+    return _upsert_test_user(900000001, "pytest-auth-user")
+
+
+@pytest.fixture(scope="session")
+def auth_headers(auth_user):
+    """Bearer header for the primary test user."""
+    from core.security import create_access_token
+
+    token = create_access_token(user_id=str(auth_user["_id"]), role="user")
+    return {"Authorization": f"Bearer {token}"}
+
+
+@pytest.fixture(scope="session")
+def other_auth_user(client):
+    """Persisted second test user."""
+    return _upsert_test_user(900000002, "pytest-other-user")
+
+
+@pytest.fixture(scope="session")
+def other_auth_headers(other_auth_user):
+    """Bearer header for a second user (foreign-resource 404 tests)."""
+    from core.security import create_access_token
+
+    token = create_access_token(user_id=str(other_auth_user["_id"]), role="user")
+    return {"Authorization": f"Bearer {token}"}

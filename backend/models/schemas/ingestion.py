@@ -1,7 +1,7 @@
 """Pydantic schemas for ingestion endpoints."""
 
 from datetime import datetime
-from typing import Optional
+from typing import List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 
@@ -40,6 +40,10 @@ class IngestionResponse(BaseModel):
     branch: str = Field(..., description="Repository branch")
     commit_hash: Optional[str] = Field(None, description="Repository commit hash")
     status: IngestionStatus = Field(..., description="Initial status")
+    linked: bool = Field(
+        default=False,
+        description="True when the repo was added to the caller's library without a new job",
+    )
     message: str = Field(..., description="Status message")
 
     model_config = ConfigDict(
@@ -118,3 +122,12 @@ class IngestionStatusResponse(BaseModel):
             }
         }
     )
+
+
+class IngestionRequestListResponse(BaseModel):
+    """Paginated list of the caller's ingestion jobs."""
+
+    requests: List[IngestionStatusResponse] = Field(..., description="Jobs newest first")
+    total: int = Field(..., description="Total jobs for this user")
+    skip: int = Field(..., description="Number skipped")
+    limit: int = Field(..., description="Page size")

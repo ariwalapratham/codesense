@@ -41,12 +41,13 @@ def _insert_job(coll, **fields):
     return str(coll.insert_one(doc).inserted_id)
 
 
-def test_status_includes_progress(client, auth_headers):
+def test_status_includes_progress(client, auth_headers, auth_user):
     mongo_client, coll = _collection()
     request_id = None
     try:
         request_id = _insert_job(
             coll,
+            requested_by=auth_user["_id"],
             progress={
                 "stage": "queued",
                 "files_total": 12,
@@ -77,11 +78,11 @@ def test_status_includes_progress(client, auth_headers):
         mongo_client.close()
 
 
-def test_cancel_pending_job(client, auth_headers):
+def test_cancel_pending_job(client, auth_headers, auth_user):
     mongo_client, coll = _collection()
     request_id = None
     try:
-        request_id = _insert_job(coll)
+        request_id = _insert_job(coll, requested_by=auth_user["_id"])
         response = client.post(
             f"/repository/ingest/{request_id}/cancel",
             headers=auth_headers,
@@ -98,11 +99,11 @@ def test_cancel_pending_job(client, auth_headers):
         mongo_client.close()
 
 
-def test_cancel_processing_job(client, auth_headers):
+def test_cancel_processing_job(client, auth_headers, auth_user):
     mongo_client, coll = _collection()
     request_id = None
     try:
-        request_id = _insert_job(coll, status="processing")
+        request_id = _insert_job(coll, status="processing", requested_by=auth_user["_id"])
         response = client.post(
             f"/repository/ingest/{request_id}/cancel",
             headers=auth_headers,
@@ -118,11 +119,11 @@ def test_cancel_processing_job(client, auth_headers):
         mongo_client.close()
 
 
-def test_cancel_completed_job_returns_conflict(client, auth_headers):
+def test_cancel_completed_job_returns_conflict(client, auth_headers, auth_user):
     mongo_client, coll = _collection()
     request_id = None
     try:
-        request_id = _insert_job(coll, status="completed")
+        request_id = _insert_job(coll, status="completed", requested_by=auth_user["_id"])
         response = client.post(
             f"/repository/ingest/{request_id}/cancel",
             headers=auth_headers,

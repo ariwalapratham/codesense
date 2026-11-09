@@ -18,6 +18,7 @@ from schemas import (
     RepositorySchema,
     ChatMessageDocument,
     IngestionRequestSchema,
+    UserRepositorySchema,
 )
 
 # pylint: disable=broad-exception-caught
@@ -78,6 +79,92 @@ class MongoDBService:
         if isinstance(value, str) and ObjectId.is_valid(value):
             return ObjectId(value)
         raise ValueError(f"Invalid ObjectId value: {value}")
+
+    def _session_filter(
+        self,
+        repo_id: Union[str, ObjectId],
+        session_id: str,
+        user_id: Optional[Union[str, ObjectId]] = None,
+    ) -> Dict:
+        """Match a chat session, scoped to user_id when given."""
+        filt: Dict = {
+            "repo_id": self._to_object_id(repo_id),
+            "session_id": session_id,
+        }
+        if user_id is not None:
+            filt["user_id"] = self._to_object_id(user_id)
+        return filt
+
+    async def has_library_access(
+        self,
+        user_id: Union[str, ObjectId],
+        repo_id: Union[str, ObjectId],
+    ) -> bool:
+        """True when csUserRepositories has (user_id, repo_id)."""
+        try:
+            doc = await self.user_repositories.find_one(
+                {
+                    "user_id": self._to_object_id(user_id),
+                    "repo_id": self._to_object_id(repo_id),
+                },
+                {"_id": 1},
+            )
+            return doc is not None
+        except PyMongoError:
+            logger.error("Failed library access check", exc_info=True)
+            raise
+        except Exception as e:
+            logger.error("Failed library access check: %s", e, exc_info=True)
+            raise
+
+    async def upsert_library_link(
+        self,
+        user_id: Union[str, ObjectId],
+        repo_id: Union[str, ObjectId],
+        *,
+        role: str = "member",
+    ) -> bool:
+        """Add the repo to the user's library. Idempotent on (user_id, repo_id)."""
+        try:
+            user_oid = self._to_object_id(user_id)
+            repo_oid = self._to_object_id(repo_id)
+            link = UserRepositorySchema(user_id=user_oid, repo_id=repo_oid, role=role)
+            dumped = link.model_dump()
+            result = await self.user_repositories.update_one(
+                {"user_id": user_oid, "repo_id": repo_oid},
+                {
+                    "$setOnInsert": {
+                        "user_id": dumped["user_id"],
+                        "repo_id": dumped["repo_id"],
+                        "role": dumped["role"],
+                        "added_at": dumped["added_at"],
+                        "last_opened_at": dumped["last_opened_at"],
+                    }
+                },
+                upsert=True,
+            )
+            return result.acknowledged
+        except Exception as e:
+            logger.error("Failed to upsert library link: %s", e, exc_info=True)
+            return False
+
+    async def unlink_library(
+        self,
+        user_id: Union[str, ObjectId],
+        repo_id: Union[str, ObjectId],
+    ) -> bool:
+        """Remove the library row only. Indexed repo data stays."""
+        try:
+            result = await self.user_repositories.delete_one(
+                {
+                    "user_id": self._to_object_id(user_id),
+                    "repo_id": self._to_object_id(repo_id),
+                }
+            )
+            return result.deleted_count > 0
+        except Exception as e:
+            logger.error("Failed to unlink library row: %s", e, exc_info=True)
+            return False
 
     async def upsert_repository(self, repo_data: Dict) -> Optional[ObjectId]:
         """
@@ -179,29 +266,24 @@ class MongoDBService:
             return False
 
     async def list_chat_sessions(
-        self, repo_id: str, skip: int = 0, limit: int = 10
+        self,
+        repo_id: str,
+        skip: int = 0,
+        limit: int = 10,
+        user_id: Optional[Union[str, ObjectId]] = None,
     ) -> Tuple[List[Dict], int]:
-        """
-        List chat sessions for a repository with pagination.
-
-        Args:
-            repo_id: Repository identifier
-            skip: Number of sessions to skip
-            limit: Maximum number of sessions to return
-
-        Returns:
-            Tuple of (list of session dictionaries, total count)
-        """
+        """List chat sessions for a repository, scoped to user_id when given."""
         try:
             repo_object_id = self._to_object_id(repo_id)
+            query: Dict = {"repo_id": repo_object_id}
+            if user_id is not None:
+                query["user_id"] = self._to_object_id(user_id)
 
-            # Get total count
-            total = await self.chat_sessions.count_documents({"repo_id": repo_object_id})
+            total = await self.chat_sessions.count_documents(query)
 
-            # Fetch sessions with pagination
             cursor = (
                 self.chat_sessions.find(
-                    {"repo_id": repo_object_id},
+                    query,
                     {
                         "_id": 0,
                         "session_id": 1,
@@ -241,7 +323,7 @@ class MongoDBService:
             session_schema = ChatSessionSchema(
                 session_id=session_id,
                 repo_id=repo_object_id,
-                user_id=ObjectId(user_id) if user_id else None,
+                user_id=self._to_object_id(user_id) if user_id else None,
                 title=title,
             )
             session_doc = session_schema.model_dump()
@@ -258,13 +340,13 @@ class MongoDBService:
         repo_id: str,
         session_id: str,
         updates: Dict,
+        user_id: Optional[Union[str, ObjectId]] = None,
     ) -> bool:
         """Update chat session metadata."""
         try:
-            repo_object_id = self._to_object_id(repo_id)
             updates["updated_at"] = datetime.now()
             result = await self.chat_sessions.update_one(
-                {"repo_id": repo_object_id, "session_id": session_id},
+                self._session_filter(repo_id, session_id, user_id),
                 {"$set": updates},
             )
             return result.matched_count > 0
@@ -278,12 +360,16 @@ class MongoDBService:
             )
             return False
 
-    async def delete_chat_session(self, repo_id: str, session_id: str) -> bool:
+    async def delete_chat_session(
+        self,
+        repo_id: str,
+        session_id: str,
+        user_id: Optional[Union[str, ObjectId]] = None,
+    ) -> bool:
         """Delete a chat session and its messages."""
         try:
-            repo_object_id = self._to_object_id(repo_id)
             result = await self.chat_sessions.delete_one(
-                {"repo_id": repo_object_id, "session_id": session_id}
+                self._session_filter(repo_id, session_id, user_id)
             )
             return result.deleted_count > 0
         except Exception as e:  # pylint: disable=broad-except
@@ -296,14 +382,16 @@ class MongoDBService:
             )
             return False
 
-    async def get_chat_session(self, repo_id: str, session_id: str) -> Optional[Dict]:
-        """
-        Fetch a chat session document by repository and session identifiers.
-        """
+    async def get_chat_session(
+        self,
+        repo_id: str,
+        session_id: str,
+        user_id: Optional[Union[str, ObjectId]] = None,
+    ) -> Optional[Dict]:
+        """Fetch a chat session. When user_id is set, other users' sessions 404."""
         try:
-            repo_object_id = self._to_object_id(repo_id)
             session_doc = await self.chat_sessions.find_one(
-                {"repo_id": repo_object_id, "session_id": session_id}
+                self._session_filter(repo_id, session_id, user_id)
             )
             if session_doc:
                 session_doc.pop("_id", None)
@@ -324,15 +412,13 @@ class MongoDBService:
         repo_id: str,
         session_id: str,
         message: Dict,
+        user_id: Optional[Union[str, ObjectId]] = None,
     ) -> bool:
-        """
-        Append a chat message to a session.
-        """
+        """Append a chat message to a session."""
         try:
-            repo_object_id = self._to_object_id(repo_id)
             message_doc = ChatMessageDocument(**message).model_dump()
             result = await self.chat_sessions.update_one(
-                {"repo_id": repo_object_id, "session_id": session_id},
+                self._session_filter(repo_id, session_id, user_id),
                 {
                     "$push": {"messages": message_doc},
                     "$set": {"updated_at": datetime.now()},
@@ -475,7 +561,12 @@ class MongoDBService:
             return []
 
     async def get_chat_messages(
-        self, repo_id: str, session_id: str, skip: int = 0, limit: int = 50
+        self,
+        repo_id: str,
+        session_id: str,
+        skip: int = 0,
+        limit: int = 50,
+        user_id: Optional[Union[str, ObjectId]] = None,
     ) -> Tuple[List[Dict], int]:
         """
         Get chat messages for a session with pagination.
@@ -490,12 +581,9 @@ class MongoDBService:
             Tuple of (list of message dictionaries, total count)
         """
         try:
-            repo_object_id = self._to_object_id(repo_id)
-
-            # Find the session to get messages
             session_doc = await self.chat_sessions.find_one(
-                {"repo_id": repo_object_id, "session_id": session_id},
-                {"messages": 1}
+                self._session_filter(repo_id, session_id, user_id),
+                {"messages": 1},
             )
 
             if not session_doc:
@@ -912,35 +1000,39 @@ class MongoDBService:
         self,
         skip: int = 0,
         limit: int = 10,
-        search: Optional[str] = None
+        search: Optional[str] = None,
+        user_id: Optional[Union[str, ObjectId]] = None,
     ) -> Tuple[List[Dict], int]:
-        """
-        List repositories with pagination and optional search.
-        Includes both completed repositories and in-progress ingestion requests.
-
-        Args:
-            skip: Number of repositories to skip
-            limit: Maximum number of repositories to return
-            search: Optional search query to filter by repo_name, owner, or repository_url
-
-        Returns:
-            Tuple of (list of repository dictionaries, total count)
-        """
+        """List the caller's library repos, newest link first."""
         try:
-            # Build search filter for both collections
-            search_filter = {}
+            if user_id is None:
+                return [], 0
+
+            user_oid = self._to_object_id(user_id)
+            links = await self.user_repositories.find(
+                {"user_id": user_oid},
+                {"repo_id": 1, "added_at": 1},
+            ).sort("added_at", -1).to_list(length=None)
+            if not links:
+                return [], 0
+
+            order = {link["repo_id"]: index for index, link in enumerate(links)}
+            repo_filter: Dict = {"_id": {"$in": list(order.keys())}}
             if search:
-                # Case-insensitive regex search across repo_name, owner, and repository_url
                 search_regex = {"$regex": search, "$options": "i"}
-                search_filter = {
-                    "$or": [
-                        {"repo_name": search_regex},
-                        {"owner": search_regex},
-                        {"repository_url": search_regex}
+                repo_filter = {
+                    "$and": [
+                        repo_filter,
+                        {
+                            "$or": [
+                                {"repo_name": search_regex},
+                                {"owner": search_regex},
+                                {"repository_url": search_regex},
+                            ]
+                        },
                     ]
                 }
 
-            # 1. Get completed repositories
             repo_projection = {
                 "repo_name": 1,
                 "repository_url": 1,
@@ -948,107 +1040,32 @@ class MongoDBService:
                 "files_processed": 1,
                 "created_at": 1,
                 "updated_at": 1,
-                "owner": 1,  # Add owner for deduplication
-                "branch": 1,  # Add branch for deduplication
-                "_id": 1
+                "_id": 1,
             }
-
             repo_docs = await self.repositories.find(
-                search_filter, repo_projection
-            ).to_list(length=None)  # Get all matching repos
-            
-            # Convert to dict format using owner/repo_name/branch as key
-            repos_dict = {}
+                repo_filter, repo_projection
+            ).to_list(length=None)
+
+            summaries = []
             for repo_doc in repo_docs:
-                owner = repo_doc.get("owner", "")
-                repo_name = repo_doc.get("repo_name", "")
-                branch = repo_doc.get("branch", "main")
-                # Use owner/repo_name/branch as key for deduplication
-                key = f"{owner}_{repo_name}_{branch}".lower()
-                
-                repos_dict[key] = {
-                    "id": str(repo_doc["_id"]),
-                    "repo_name": repo_name,
-                    "repository_url": repo_doc.get("repository_url"),
-                    "status": repo_doc.get("status", "completed"),
-                    "files_processed": repo_doc.get("files_processed", 0),
-                    "created_at": repo_doc.get("created_at"),
-                    "updated_at": repo_doc.get("updated_at"),
-                    "_source": "repository"  # Track source for deduplication
-                }
-
-            # 2. Get in-progress ingestion requests (pending/processing)
-            ingestion_filter = {
-                **search_filter,
-                "status": {"$in": ["pending", "processing"]}
-            }
-            
-            ingestion_projection = {
-                "repo_name": 1,
-                "repository_url": 1,
-                "status": 1,
-                "created_at": 1,
-                "updated_at": 1,
-                "owner": 1,
-                "branch": 1,
-                "_id": 1
-            }
-            
-            ingestion_docs = await self.ingestion_requests.find(
-                ingestion_filter, ingestion_projection
-            ).to_list(length=None)  # Get all matching requests
-            
-            # Merge ingestion requests (prefer repository if exists)
-            for req_doc in ingestion_docs:
-                owner = req_doc.get("owner", "")
-                repo_name = req_doc.get("repo_name", "")
-                branch = req_doc.get("branch", "main")
-                key = f"{owner}_{repo_name}_{branch}".lower()
-                
-                # Only add if not already in repos_dict (repository takes precedence)
-                if key not in repos_dict:
-                    # Generate encoded_id for in-progress repos
-                    encoded_id = _encode_repo_identifier(owner, repo_name, branch)
-                    
-                    repos_dict[key] = {
-                        "id": encoded_id,  # Use encoded_id for status queries
-                        "repo_name": repo_name,
-                        "repository_url": req_doc.get("repository_url"),
-                        "status": req_doc.get("status", "pending"),
-                        "files_processed": 0,  # No files processed yet
-                        "created_at": req_doc.get("created_at"),
-                        "updated_at": req_doc.get("updated_at"),
-                        "_source": "ingestion_request"
+                summaries.append(
+                    {
+                        "id": str(repo_doc["_id"]),
+                        "repo_name": repo_doc.get("repo_name"),
+                        "repository_url": repo_doc.get("repository_url"),
+                        "status": repo_doc.get("status", "completed"),
+                        "files_processed": repo_doc.get("files_processed", 0),
+                        "created_at": repo_doc.get("created_at"),
+                        "updated_at": repo_doc.get("updated_at"),
+                        "_order": order.get(repo_doc["_id"], 0),
                     }
-
-            # 3. Convert to list and sort by updated_at descending
-            all_repos = list(repos_dict.values())
-            # Sort by updated_at, handling None values
-            all_repos.sort(
-                key=lambda x: x.get("updated_at") or datetime.min,
-                reverse=True
-            )
-
-            # 4. Get total count
-            total = len(all_repos)
-
-            # 5. Apply pagination
-            paginated_repos = all_repos[skip:skip + limit]
-
-            # 6. Remove temporary _source field before returning
-            for repo in paginated_repos:
-                repo.pop("_source", None)
-
-            logger.debug(
-                "Listed %d repositories (skip: %d, limit: %d, total: %d, search: %s)",
-                len(paginated_repos),
-                skip,
-                limit,
-                total,
-                search or "none"
-            )
-
-            return paginated_repos, total
+                )
+            summaries.sort(key=lambda item: item["_order"])
+            total = len(summaries)
+            page = summaries[skip:skip + limit]
+            for repo in page:
+                repo.pop("_order", None)
+            return page, total
 
         except PyMongoError as e:
             logger.error(
@@ -1209,6 +1226,33 @@ class MongoDBService:
             )
             return None
 
+    async def list_ingestion_requests(
+        self,
+        user_id: Union[str, ObjectId],
+        skip: int = 0,
+        limit: int = 20,
+    ) -> Tuple[List[Dict], int]:
+        """List ingestion jobs created by this user, newest first."""
+        try:
+            filt = {"requested_by": self._to_object_id(user_id)}
+            total = await self.ingestion_requests.count_documents(filt)
+            cursor = (
+                self.ingestion_requests.find(filt)
+                .sort("created_at", -1)
+                .skip(skip)
+                .limit(limit)
+            )
+            docs = await cursor.to_list(length=limit)
+            for doc in docs:
+                doc["id"] = str(doc["_id"])
+                doc.pop("_id", None)
+                if doc.get("repo_id"):
+                    doc["repo_id"] = str(doc["repo_id"])
+            return docs, total
+        except Exception as e:
+            logger.error("Failed to list ingestion requests: %s", e, exc_info=True)
+            return [], 0
+
     async def get_ingestion_request_by_repo_id(
         self,
         repo_id: str
@@ -1254,27 +1298,20 @@ class MongoDBService:
         self,
         owner: str,
         repo_name: str,
-        branch: Optional[str] = None
+        branch: Optional[str] = None,
+        requested_by: Optional[Union[str, ObjectId]] = None,
     ) -> Optional[Dict]:
-        """
-        Get the most recent ingestion request by repository identifier.
-
-        Args:
-            owner: Repository owner
-            repo_name: Repository name
-            branch: Repository branch (optional)
-
-        Returns:
-            Ingestion request dictionary or None if not found
-        """
+        """Get the most recent ingestion request for this identifier, optionally owned by the caller."""
         try:
-            query = {
+            query: Dict = {
                 "owner": owner,
-                "repo_name": repo_name
+                "repo_name": repo_name,
             }
 
             if branch:
                 query["branch"] = branch
+            if requested_by is not None:
+                query["requested_by"] = self._to_object_id(requested_by)
 
             request_doc = await self.ingestion_requests.find_one(
                 query,

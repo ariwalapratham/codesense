@@ -1,7 +1,12 @@
 """Schema package exports."""
 
 from .auth import TokenResponse, UserPublic
-from .ingestion import IngestionRequest, IngestionResponse, IngestionStatusResponse
+from .ingestion import (
+    IngestionRequest,
+    IngestionRequestListResponse,
+    IngestionResponse,
+    IngestionStatusResponse,
+)
 from .repository import (
     DeleteRepositoryResponse,
     ParsingStatsResponse,
@@ -28,6 +33,7 @@ __all__ = [
     "UserPublic",
     # Ingestion
     "IngestionRequest",
+    "IngestionRequestListResponse",
     "IngestionResponse",
     "IngestionStatusResponse",
     # Repository
