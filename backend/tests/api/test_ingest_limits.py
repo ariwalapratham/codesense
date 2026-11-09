@@ -19,7 +19,7 @@ def ingest_github_mocks(monkeypatch):
     monkeypatch.setattr(RepositoryService, "get_remote_commit_hash", commit_hash)
 
 
-def test_oversized_repo_returns_413(client, ingest_github_mocks, monkeypatch):
+def test_oversized_repo_returns_413(client, auth_headers, ingest_github_mocks, monkeypatch):
     async def huge(self, repo_url):
         return (settings.max_repo_size_mb * 1024) + 1
 
@@ -27,6 +27,7 @@ def test_oversized_repo_returns_413(client, ingest_github_mocks, monkeypatch):
     response = client.post(
         "/repository/ingest",
         json={"repo_url": "https://github.com/codesense-test/too-large"},
+        headers=auth_headers,
     )
     assert response.status_code == 413
     error = response.json()["error"]
@@ -34,7 +35,7 @@ def test_oversized_repo_returns_413(client, ingest_github_mocks, monkeypatch):
     assert error["details"]["limit_mb"] == settings.max_repo_size_mb
 
 
-def test_unknown_repo_size_returns_413(client, ingest_github_mocks, monkeypatch):
+def test_unknown_repo_size_returns_413(client, auth_headers, ingest_github_mocks, monkeypatch):
     async def unknown(self, repo_url):
         return None
 
@@ -42,6 +43,7 @@ def test_unknown_repo_size_returns_413(client, ingest_github_mocks, monkeypatch)
     response = client.post(
         "/repository/ingest",
         json={"repo_url": "https://github.com/codesense-test/unknown-size"},
+        headers=auth_headers,
     )
     assert response.status_code == 413
     error = response.json()["error"]

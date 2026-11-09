@@ -10,6 +10,7 @@ from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from api.deps import (
+    get_current_user,
     get_ingestion_service,
     get_job_queue,
     get_mongodb_service,
@@ -46,6 +47,7 @@ _search_limiter = RateLimitTracker(rpm_limit=30, tpm_limit=30000, rpd_limit=200)
 router = APIRouter(
     prefix="/repository",
     tags=["repository"],
+    dependencies=[Depends(get_current_user)],
 )
 
 

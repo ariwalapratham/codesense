@@ -33,3 +33,47 @@ def client():
                 pytest.fail("MongoDB is required for API tests in CI")
             pytest.skip("MongoDB is required for API tests")
         yield test_client
+
+
+@pytest.fixture(scope="session")
+def auth_headers(client):
+    """Bearer header for a persisted test user. Repository/chat routes require this."""
+    from datetime import datetime, timezone
+
+    from bson import ObjectId
+    from pymongo import MongoClient
+
+    from config.settings import settings
+    from core.security import create_access_token
+
+    now = datetime.now(timezone.utc)
+    mongo = MongoClient(settings.mongodb_url, serverSelectionTimeoutMS=5000)
+    try:
+        users = mongo[settings.db_name]["csUsers"]
+        users.update_one(
+            {"github_id": 900000001},
+            {
+                "$set": {
+                    "github_login": "pytest-auth-user",
+                    "status": "active",
+                    "role": "user",
+                    "last_login_at": now,
+                },
+                "$setOnInsert": {
+                    "_id": ObjectId(),
+                    "github_id": 900000001,
+                    "created_at": now,
+                    "quota_overrides": {
+                        "repos": None,
+                        "ingests_per_day": None,
+                        "chat_per_day": None,
+                    },
+                },
+            },
+            upsert=True,
+        )
+        doc = users.find_one({"github_id": 900000001})
+        token = create_access_token(user_id=str(doc["_id"]), role="user")
+        yield {"Authorization": f"Bearer {token}"}
+    finally:
+        mongo.close()

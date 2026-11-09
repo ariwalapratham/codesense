@@ -6,10 +6,11 @@ from services.retrieval_service import RetrievalService
 from services.vector_store.memory import MemoryVectorStore
 
 
-def test_search_unknown_repo_returns_not_found(client):
+def test_search_unknown_repo_returns_not_found(client, auth_headers):
     response = client.get(
         "/repository/507f1f77bcf86cd799439011/search",
         params={"q": "def add"},
+        headers=auth_headers,
     )
     assert response.status_code == 404
     error = response.json()["error"]
@@ -17,10 +18,11 @@ def test_search_unknown_repo_returns_not_found(client):
     assert error["request_id"] == response.headers.get("x-request-id")
 
 
-def test_search_empty_query_returns_400(client):
+def test_search_empty_query_returns_400(client, auth_headers):
     response = client.get(
         "/repository/507f1f77bcf86cd799439011/search",
         params={"q": "   "},
+        headers=auth_headers,
     )
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "validation_error"

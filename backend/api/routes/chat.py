@@ -5,7 +5,7 @@ import logging
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
 
-from api.deps import get_chat_service, get_mongodb_service
+from api.deps import get_chat_service, get_current_user, get_mongodb_service
 from core.errors import AppError
 from models.schemas import (
     ChatMessageItem,
@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(
     prefix="/repository/{repo_id}/chat-sessions",
     tags=["chat"],
+    dependencies=[Depends(get_current_user)],
 )
 
 

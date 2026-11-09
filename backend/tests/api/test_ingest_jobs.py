@@ -41,7 +41,7 @@ def _insert_job(coll, **fields):
     return str(coll.insert_one(doc).inserted_id)
 
 
-def test_status_includes_progress(client):
+def test_status_includes_progress(client, auth_headers):
     mongo_client, coll = _collection()
     request_id = None
     try:
@@ -55,7 +55,10 @@ def test_status_includes_progress(client):
                 "chunks_embedded": 0,
             },
         )
-        response = client.get(f"/repository/ingest/status/{request_id}")
+        response = client.get(
+            f"/repository/ingest/status/{request_id}",
+            headers=auth_headers,
+        )
         assert response.status_code == 200
         body = response.json()
         assert body["request_id"] == request_id
@@ -74,12 +77,15 @@ def test_status_includes_progress(client):
         mongo_client.close()
 
 
-def test_cancel_pending_job(client):
+def test_cancel_pending_job(client, auth_headers):
     mongo_client, coll = _collection()
     request_id = None
     try:
         request_id = _insert_job(coll)
-        response = client.post(f"/repository/ingest/{request_id}/cancel")
+        response = client.post(
+            f"/repository/ingest/{request_id}/cancel",
+            headers=auth_headers,
+        )
         assert response.status_code == 200
         body = response.json()
         assert body["status"] == "cancelled"
@@ -92,12 +98,15 @@ def test_cancel_pending_job(client):
         mongo_client.close()
 
 
-def test_cancel_processing_job(client):
+def test_cancel_processing_job(client, auth_headers):
     mongo_client, coll = _collection()
     request_id = None
     try:
         request_id = _insert_job(coll, status="processing")
-        response = client.post(f"/repository/ingest/{request_id}/cancel")
+        response = client.post(
+            f"/repository/ingest/{request_id}/cancel",
+            headers=auth_headers,
+        )
         assert response.status_code == 200
         body = response.json()
         assert body["status"] == "cancelled"
@@ -109,12 +118,15 @@ def test_cancel_processing_job(client):
         mongo_client.close()
 
 
-def test_cancel_completed_job_returns_conflict(client):
+def test_cancel_completed_job_returns_conflict(client, auth_headers):
     mongo_client, coll = _collection()
     request_id = None
     try:
         request_id = _insert_job(coll, status="completed")
-        response = client.post(f"/repository/ingest/{request_id}/cancel")
+        response = client.post(
+            f"/repository/ingest/{request_id}/cancel",
+            headers=auth_headers,
+        )
         assert response.status_code == 409
         assert response.json()["error"]["code"] == "conflict"
     finally:
@@ -123,7 +135,10 @@ def test_cancel_completed_job_returns_conflict(client):
         mongo_client.close()
 
 
-def test_cancel_unknown_job_returns_not_found(client):
-    response = client.post(f"/repository/ingest/{ObjectId()}/cancel")
+def test_cancel_unknown_job_returns_not_found(client, auth_headers):
+    response = client.post(
+        f"/repository/ingest/{ObjectId()}/cancel",
+        headers=auth_headers,
+    )
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "not_found"
