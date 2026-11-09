@@ -9,7 +9,9 @@ from .ingestion_request_schema import (
     IngestionStage,
     IngestionStatus,
 )
+from .refresh_token_schema import RefreshTokenSchema
 from .repository_schema import ParsingStats, RepositorySchema
+from .user_schema import QuotaOverrides, UserSchema
 
 __all__ = [
     "ChatMessageDocument",
@@ -22,5 +24,8 @@ __all__ = [
     "IngestionStage",
     "IngestionStatus",
     "ParsingStats",
+    "QuotaOverrides",
+    "RefreshTokenSchema",
     "RepositorySchema",
+    "UserSchema",
 ]

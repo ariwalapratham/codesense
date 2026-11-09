@@ -43,3 +43,22 @@ def test_chunk_v2_non_unique_indexes_present():
         for model in models
     }
     assert "ux_chunks_point_id" not in unique_names
+
+
+def test_auth_indexes_are_declared():
+    unique_names = {
+        model.document["name"]
+        for models in _UNIQUE_INDEXES.values()
+        for model in models
+    }
+    assert "ux_users_github_id" in unique_names
+    assert "ux_users_github_login" in unique_names
+    assert "ux_refresh_tokens_token_hash" in unique_names
+    refresh_non_unique = {
+        model.document["name"]: model.document
+        for model in _NON_UNIQUE_INDEXES["csRefreshTokens"]
+    }
+    assert "idx_refresh_tokens_family_id" in refresh_non_unique
+    assert "idx_refresh_tokens_user_id" in refresh_non_unique
+    ttl = refresh_non_unique["ttl_refresh_tokens_expires_at"]
+    assert ttl.get("expireAfterSeconds") == 0

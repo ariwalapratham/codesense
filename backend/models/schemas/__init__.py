@@ -1,5 +1,6 @@
 """Schema package exports."""
 
+from .auth import TokenResponse, UserPublic
 from .ingestion import IngestionRequest, IngestionResponse, IngestionStatusResponse
 from .repository import (
     DeleteRepositoryResponse,
@@ -23,6 +24,8 @@ from .chat import (
 )
 
 __all__ = [
+    "TokenResponse",
+    "UserPublic",
     # Ingestion
     "IngestionRequest",
     "IngestionResponse",

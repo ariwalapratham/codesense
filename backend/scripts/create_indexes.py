@@ -90,6 +90,21 @@ _NON_UNIQUE_INDEXES = {
             },
         ),
     ],
+    "csRefreshTokens": [
+        IndexModel(
+            [("family_id", ASCENDING)],
+            name="idx_refresh_tokens_family_id",
+        ),
+        IndexModel(
+            [("user_id", ASCENDING)],
+            name="idx_refresh_tokens_user_id",
+        ),
+        IndexModel(
+            [("expires_at", ASCENDING)],
+            name="ttl_refresh_tokens_expires_at",
+            expireAfterSeconds=0,
+        ),
+    ],
 }
 
 _UNIQUE_INDEXES = {
@@ -107,6 +122,25 @@ _UNIQUE_INDEXES = {
         IndexModel(
             [("repo_id", ASCENDING), ("session_id", ASCENDING)],
             name="ux_chat_sessions_repo_id_session_id",
+            unique=True,
+        ),
+    ],
+    "csUsers": [
+        IndexModel(
+            [("github_id", ASCENDING)],
+            name="ux_users_github_id",
+            unique=True,
+        ),
+        IndexModel(
+            [("github_login", ASCENDING)],
+            name="ux_users_github_login",
+            unique=True,
+        ),
+    ],
+    "csRefreshTokens": [
+        IndexModel(
+            [("token_hash", ASCENDING)],
+            name="ux_refresh_tokens_token_hash",
             unique=True,
         ),
     ],
