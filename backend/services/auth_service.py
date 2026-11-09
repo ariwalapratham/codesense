@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from bson import ObjectId
+from bson.errors import InvalidId
 from pymongo import ReturnDocument
 from pymongo.errors import OperationFailure
 
@@ -24,6 +25,11 @@ _EMPTY_QUOTAS = {
     "ingests_per_day": None,
     "chat_per_day": None,
 }
+# stopgap: count recent csRefreshTokens per user. Later we should replace this
+# with persisted quota counters (do not add a dedicated rate-limit collection).
+REFRESH_RATE_WINDOW = timedelta(minutes=15)
+REFRESH_RATE_MAX = 20
+_TXN_UNSUPPORTED_CODE = 20
 
 
 def _now() -> datetime:
@@ -32,6 +38,13 @@ def _now() -> datetime:
 
 def _session_kw(session: Any) -> dict:
     return {"session": session} if session is not None else {}
+
+
+def _transactions_unsupported(exc: OperationFailure) -> bool:
+    """True when Mongo cannot run transactions (standalone / code 20)."""
+    if getattr(exc, "code", None) == _TXN_UNSUPPORTED_CODE:
+        return True
+    return "transaction numbers are only allowed" in str(exc).lower()
 
 
 @dataclass(frozen=True)
@@ -82,6 +95,14 @@ class AuthService:
                 status_code=500,
             )
         return doc
+
+    async def get_user(self, user_id: str) -> Optional[dict]:
+        """Return a user document by ObjectId string, or None."""
+        try:
+            oid = ObjectId(user_id)
+        except (InvalidId, TypeError):
+            return None
+        return await self._users.find_one({"_id": oid})
 
     async def _release_stale_login(self, login: str, github_id: int) -> None:
         """Free github_login if another github_id still holds it (rename / reassignment)."""
@@ -150,12 +171,14 @@ class AuthService:
             return await self._rotate_refresh(raw_token, user_agent=user_agent)
         try:
             async with client.start_session() as session:
-                async with session.start_transaction():
+                async with await session.start_transaction():
                     return await self._rotate_refresh(
                         raw_token, user_agent=user_agent, session=session
                     )
-        except OperationFailure:
-            return await self._rotate_refresh(raw_token, user_agent=user_agent)
+        except OperationFailure as exc:
+            if _transactions_unsupported(exc):
+                return await self._rotate_refresh(raw_token, user_agent=user_agent)
+            raise
 
     async def _rotate_refresh(
         self,
@@ -217,6 +240,24 @@ class AuthService:
             {"family_id": family_id, "revoked_at": None},
             {"$set": {"revoked_at": _now()}},
             **_session_kw(session),
+        )
+
+    async def enforce_refresh_rate(self, raw_token: str) -> None:
+        """Reject refresh if this user already minted too many tokens in the window."""
+        current = await self._refresh.find_one({"token_hash": hash_refresh_token(raw_token)})
+        if not current:
+            return
+        cutoff = _now() - REFRESH_RATE_WINDOW
+        count = await self._refresh.count_documents(
+            {"user_id": current["user_id"], "created_at": {"$gt": cutoff}}
+        )
+        if count < REFRESH_RATE_MAX:
+            return
+        raise AppError(
+            "Refresh rate limit exceeded",
+            code="rate_limited",
+            status_code=429,
+            details={"retry_after": int(REFRESH_RATE_WINDOW.total_seconds())},
         )
 
     async def logout(self, raw_token: Optional[str]) -> None:

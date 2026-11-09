@@ -15,6 +15,9 @@ os.environ["GEMINI_API_KEY"] = ""
 os.environ["QDRANT_URL"] = ""
 os.environ["QDRANT_API_KEY"] = ""
 os.environ["INGESTION_WORKER_ENABLED"] = "false"
+os.environ["JWT_SECRET"] = "codesense-test-jwt-secret-not-for-prod"
+os.environ["GITHUB_OAUTH_CLIENT_ID"] = "test-oauth-client-id"
+os.environ["GITHUB_OAUTH_CLIENT_SECRET"] = "test-oauth-client-secret"
 
 
 @pytest.fixture(scope="session")

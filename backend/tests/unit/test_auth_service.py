@@ -8,15 +8,35 @@ from pymongo import ReturnDocument
 from config.settings import settings
 from core.errors import AppError
 from core.security import hash_refresh_token
+from pymongo.errors import OperationFailure
 from services.auth_service import AuthService
 from services.github.oauth import GitHubProfile
 
 _SECRET = "unit-test-jwt-secret-not-for-prod"
 
 
+class _AsyncNullCtx:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+class _FakeSession(_AsyncNullCtx):
+    async def start_transaction(self):
+        return _AsyncNullCtx()
+
+
+class _FakeClient:
+    def start_session(self):
+        return _FakeSession()
+
+
 class MemoryCollection:
     def __init__(self) -> None:
         self.docs: list[dict] = []
+        self.database = SimpleNamespace(client=_FakeClient())
 
     def _match(self, doc: dict, filt: dict) -> bool:
         for key, expected in filt.items():
@@ -83,6 +103,9 @@ class MemoryCollection:
         if return_document == ReturnDocument.BEFORE:
             return before
         return dict(self.docs[idx])
+
+    async def count_documents(self, filt: dict, **kwargs):
+        return sum(1 for doc in self.docs if self._match(doc, filt))
 
     async def update_many(self, filt: dict, update: dict, **kwargs):
         count = 0
@@ -182,6 +205,72 @@ async def test_rotate_aborts_if_family_revoked_during_insert(auth):
         await auth.rotate_refresh(first.refresh_token)
     assert exc.value.status_code == 401
     assert all(doc.get("revoked_at") is not None for doc in auth._refresh.docs)
+
+
+async def test_get_user_by_id(auth):
+    user = await auth.upsert_user_from_github(_profile())
+    found = await auth.get_user(str(user["_id"]))
+    assert found is not None
+    assert found["_id"] == user["_id"]
+    assert await auth.get_user("not-an-object-id") is None
+
+
+async def test_enforce_refresh_rate_rejects_after_window_cap(auth, monkeypatch):
+    monkeypatch.setattr("services.auth_service.REFRESH_RATE_MAX", 2)
+    user = await auth.upsert_user_from_github(_profile())
+    first = await auth.issue_token_pair(user)
+    second = await auth.rotate_refresh(first.refresh_token)
+    with pytest.raises(AppError) as exc:
+        await auth.enforce_refresh_rate(second.refresh_token)
+    assert exc.value.status_code == 429
+    assert exc.value.code == "rate_limited"
+    assert exc.value.details["retry_after"] == 15 * 60
+
+
+async def test_rotate_falls_back_when_transactions_unsupported(auth):
+    user = await auth.upsert_user_from_github(_profile())
+    pair = await auth.issue_token_pair(user)
+
+    class BoomSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def start_transaction(self):
+            raise OperationFailure("Transaction numbers are only allowed", 20)
+
+    class BoomClient:
+        def start_session(self):
+            return BoomSession()
+
+    auth._refresh.database = SimpleNamespace(client=BoomClient())
+    rotated = await auth.rotate_refresh(pair.refresh_token)
+    assert rotated.refresh_token != pair.refresh_token
+
+
+async def test_rotate_reraises_other_operation_failures(auth):
+    user = await auth.upsert_user_from_github(_profile())
+    pair = await auth.issue_token_pair(user)
+
+    class BoomSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def start_transaction(self):
+            raise OperationFailure("WriteConflict", 112)
+
+    class BoomClient:
+        def start_session(self):
+            return BoomSession()
+
+    auth._refresh.database = SimpleNamespace(client=BoomClient())
+    with pytest.raises(OperationFailure):
+        await auth.rotate_refresh(pair.refresh_token)
 
 
 async def test_expired_refresh_is_rejected(auth):

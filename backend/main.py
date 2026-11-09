@@ -8,15 +8,17 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pymongo.errors import PyMongoError
 
-from api.routes import chat, health, repository
+from api.routes import auth, chat, health, repository
 from config.settings import settings
 from core.errors import register_exception_handlers
 from core.logging import RequestContextMiddleware, setup_logging
 from database.mongodb import mongodb
 from scripts.create_indexes import apply_indexes
+from services.auth_service import AuthService
 from services.chat_service import ChatService
 from services.embeddings.fake import FakeEmbedder
 from services.embeddings.gemini import GeminiEmbedder
+from services.github import GitHubClient, GitHubOAuth
 from services.ingestion_service import IngestionService
 from services.jobs.queue import JobQueue
 from services.jobs.worker import IngestionWorker
@@ -52,6 +54,17 @@ async def lifespan(app: FastAPI):
         app.state.job_queue,
         app.state.ingestion_service,
     )
+    github_client = GitHubClient()
+    app.state.github_client = github_client
+    app.state.github_oauth = GitHubOAuth(client=github_client)
+    app.state.auth_service = AuthService(
+        mongodb.db["csUsers"],
+        mongodb.db["csRefreshTokens"],
+    )
+    if not settings.jwt_secret or not settings.github_oauth_client_id:
+        logger.warning(
+            "Auth is not fully configured; /auth/* needs JWT_SECRET and GitHub OAuth env"
+        )
 
     try:
         await apply_indexes(mongodb.db, include_unique=True)
@@ -86,6 +99,9 @@ async def lifespan(app: FastAPI):
     close = getattr(store, "close", None)
     if close is not None:
         await close()
+    github_client = getattr(app.state, "github_client", None)
+    if github_client is not None:
+        await github_client.aclose()
     await mongodb.close()
     logger.info("MongoDB connection closed")
 
@@ -123,6 +139,7 @@ app.add_middleware(RequestContextMiddleware)
 register_exception_handlers(app)
 
 app.include_router(health.router)
+app.include_router(auth.router)
 app.include_router(chat.router)
 app.include_router(repository.router)
 
