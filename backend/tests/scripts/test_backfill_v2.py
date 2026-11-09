@@ -1,7 +1,6 @@
 from bson import ObjectId
 
 from scripts.backfill_v2 import (
-    LEGACY_USER_ID,
     SCHEMA_VERSION,
     chunk_patch,
     ingestion_patch,
@@ -54,12 +53,8 @@ def test_chunk_patch_does_not_clear_existing_embedded_at():
 
 
 def test_session_and_ingestion_patches():
-    assert session_patch({}) == {
-        "user_id": LEGACY_USER_ID,
-        "schema_version": SCHEMA_VERSION,
-    }
-    assert session_patch(
-        {"user_id": LEGACY_USER_ID, "schema_version": SCHEMA_VERSION}
-    ) == {}
+    assert session_patch({}) == {"schema_version": SCHEMA_VERSION}
+    assert session_patch({"schema_version": SCHEMA_VERSION}) == {}
+    assert "user_id" not in session_patch({})
     assert ingestion_patch({}) == {"type": "full", "trigger": "user"}
     assert ingestion_patch({"type": "full", "trigger": "user"}) == {}

@@ -39,7 +39,10 @@ class ChatSessionSchema(BaseModel):
     """Schema for chat session documents."""
 
     session_id: str = Field(..., description="Public chat session identifier (unix timestamp)")
-    user_id: Optional[ObjectId] = Field(default=None, description="User identifier")
+    user_id: Optional[ObjectId] = Field(
+        default=None,
+        description="Owning user; required on new sessions",
+    )
     repo_id: ObjectId = Field(..., description="Repository identifier")
     title: Optional[str] = Field(default=None, description="Session title")
     summary: Optional[str] = Field(default=None, description="Rolling memory summary")

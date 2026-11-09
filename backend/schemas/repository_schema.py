@@ -1,7 +1,7 @@
 """Pydantic schema for repository documents in MongoDB."""
 
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from bson import ObjectId
 from pydantic import BaseModel, ConfigDict, Field
@@ -46,8 +46,8 @@ class RepositorySchema(BaseModel):
     last_ingested_at: Optional[datetime] = Field(
         None, description="Last successful ingestion timestamp"
     )
-    visibility: Optional[str] = Field(
-        None, description="public or private"
+    visibility: Literal["public", "private"] = Field(
+        default="public", description="public repos are shared; private is stretch"
     )
     owner_user_id: Optional[ObjectId] = Field(
         None, description="Owner user id; null for shared public repos"

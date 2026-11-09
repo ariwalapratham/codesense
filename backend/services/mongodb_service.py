@@ -57,6 +57,7 @@ class MongoDBService:
         self.chunks = mongodb.db["csChunks"]
         self.chat_sessions = mongodb.db["csChatSessions"]
         self.ingestion_requests = mongodb.db["csIngestionRequests"]
+        self.user_repositories = mongodb.db["csUserRepositories"]
 
     @staticmethod
     def _to_object_id(value: Union[str, ObjectId]) -> ObjectId:
@@ -96,6 +97,17 @@ class MongoDBService:
 
             repo_schema = RepositorySchema(**repo_data)
             repo_dict = repo_schema.model_dump()
+            branch = repo_dict.get("branch") or "main"
+            owner_user_id = repo_dict.get("owner_user_id")
+            repo_dict["branch"] = branch
+            repo_dict["visibility"] = repo_dict.get("visibility") or "public"
+            repo_dict["owner_user_id"] = owner_user_id
+            filt = {
+                "owner": owner,
+                "repo_name": repo_name,
+                "branch": branch,
+                "owner_user_id": owner_user_id,
+            }
 
             update_doc = {
                 "$set": {
@@ -108,7 +120,7 @@ class MongoDBService:
             }
 
             result = await self.repositories.update_one(
-                {"owner": owner, "repo_name": repo_name},
+                filt,
                 update_doc,
                 upsert=True
             )
@@ -118,10 +130,7 @@ class MongoDBService:
                 repo_object_id = result.upserted_id
             else:
                 # If it was an update, fetch the _id
-                repo_doc = await self.repositories.find_one(
-                    {"owner": owner, "repo_name": repo_name},
-                    {"_id": 1}
-                )
+                repo_doc = await self.repositories.find_one(filt, {"_id": 1})
                 repo_object_id = repo_doc["_id"] if repo_doc else None
 
             logger.info(
@@ -526,19 +535,15 @@ class MongoDBService:
         repo_name: str,
         branch: Optional[str] = None
     ) -> Optional[Dict]:
-        """
-        Find a repository by owner and repo_name.
-
-        Args:
-            owner: Repository owner
-            repo_name: Repository name
-
-        Returns:
-            Repository document if found, None otherwise
-        """
+        """Find the shared public repo for owner/name/branch (`owner_user_id` null)."""
         try:
             repo_doc = await self.repositories.find_one(
-                {"owner": owner, "repo_name": repo_name, "branch": branch}
+                {
+                    "owner": owner,
+                    "repo_name": repo_name,
+                    "branch": branch or "main",
+                    "owner_user_id": None,
+                }
             )
             return repo_doc
 

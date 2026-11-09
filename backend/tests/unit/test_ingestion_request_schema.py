@@ -1,3 +1,5 @@
+from bson import ObjectId
+
 from schemas.ingestion_request_schema import (
     IngestionRequestSchema,
     IngestionStage,
@@ -32,6 +34,18 @@ def test_target_commit_survives_dump_and_legacy_hash_is_dropped():
     assert dumped["progress"]["stage"] == "embedding"
     assert dumped["progress"]["chunks_embedded"] == 8
     assert dumped["status"] == "pending"
+
+
+def test_requested_by_survives_dump():
+    user_id = ObjectId()
+    schema = IngestionRequestSchema(
+        owner="owner",
+        repo_name="repo",
+        repository_url="https://github.com/owner/repo.git",
+        requested_by=user_id,
+    )
+    dumped = schema.model_dump()
+    assert dumped["requested_by"] == user_id
 
 
 def test_cancelled_is_a_status_and_progress_defaults_to_queued():

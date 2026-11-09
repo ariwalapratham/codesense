@@ -111,6 +111,7 @@ class IngestionRequestSchema(BaseModel):
                 "completed_at": None,
                 "message": "Processing repository...",
                 "target_commit": "a1b2c3d",
+                "requested_by": "507f1f77bcf86cd799439013",
                 "type": "full",
                 "trigger": "user",
                 "cleanup": True,

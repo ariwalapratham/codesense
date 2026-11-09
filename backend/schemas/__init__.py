@@ -11,6 +11,7 @@ from .ingestion_request_schema import (
 )
 from .refresh_token_schema import RefreshTokenSchema
 from .repository_schema import ParsingStats, RepositorySchema
+from .user_repository_schema import UserRepositorySchema
 from .user_schema import QuotaOverrides, UserSchema
 
 __all__ = [
@@ -27,5 +28,6 @@ __all__ = [
     "QuotaOverrides",
     "RefreshTokenSchema",
     "RepositorySchema",
+    "UserRepositorySchema",
     "UserSchema",
 ]

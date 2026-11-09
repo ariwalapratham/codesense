@@ -8,7 +8,6 @@ import sys
 from pathlib import Path
 from typing import Any, Callable, Dict
 
-from bson import ObjectId
 from pymongo import UpdateOne
 from pymongo.asynchronous.collection import AsyncCollection
 from pymongo.errors import PyMongoError
@@ -22,7 +21,6 @@ from services.vector_store.ids import make_point_id
 logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 2
-LEGACY_USER_ID = ObjectId("000000000000000000000001")
 _BATCH_SIZE = 500
 
 
@@ -72,9 +70,8 @@ def chunk_patch(doc: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def session_patch(doc: Dict[str, Any]) -> Dict[str, Any]:
+    """Fill schema_version only. Do not invent user_id for legacy sessions."""
     patch: Dict[str, Any] = {}
-    if not doc.get("user_id"):
-        patch["user_id"] = LEGACY_USER_ID
     if doc.get("schema_version") != SCHEMA_VERSION:
         patch["schema_version"] = SCHEMA_VERSION
     return patch

@@ -1,8 +1,8 @@
 """Create Mongo indexes after a duplicate check.
 
-Unique indexes match today's upsert keys, not the v2 key that includes
-branch and owner_user_id. The CLI duplicate-checks first. Startup only
-applies indexes (no collection scan).
+Unique repo key is (owner, repo_name, branch, owner_user_id). Run
+`backfill_v2.py` first so public repos have explicit owner_user_id null.
+The CLI duplicate-checks first. Startup only applies indexes (no collection scan).
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
-from pymongo import ASCENDING, AsyncMongoClient, IndexModel
+from pymongo import ASCENDING, DESCENDING, AsyncMongoClient, IndexModel
 from pymongo.asynchronous.database import AsyncDatabase
 from pymongo.errors import OperationFailure, PyMongoError
 
@@ -24,9 +24,20 @@ _MAX_DUPLICATE_GROUPS = 20
 
 _DUPLICATE_CHECKS = (
     ("csChunks", ("chunk_id",)),
-    ("csRepositories", ("owner", "repo_name")),
-    ("csChatSessions", ("repo_id", "session_id")),
+    ("csRepositories", ("owner", "repo_name", "branch", "owner_user_id")),
+    ("csChatSessions", ("user_id", "repo_id", "session_id")),
 )
+
+# Unique chat key is partial; null user_id rows are legacy and must not block indexes.
+_DUPLICATE_MATCHES = {
+    "csChatSessions": {"user_id": {"$type": "objectId"}},
+}
+
+# Drop obsolete repo unique only. Keep ux_chat_sessions_repo_id_session_id until Day 6b
+# writes user_id on create (partial user unique does not cover null user_id rows).
+_INDEXES_TO_DROP = {
+    "csRepositories": ("ux_repositories_owner_repo_name",),
+}
 
 _NON_UNIQUE_INDEXES = {
     "csChunks": [
@@ -53,6 +64,20 @@ _NON_UNIQUE_INDEXES = {
         IndexModel(
             [("repo_id", ASCENDING), ("updated_at", ASCENDING)],
             name="idx_chat_sessions_repo_id_updated_at",
+        ),
+        IndexModel(
+            [
+                ("user_id", ASCENDING),
+                ("repo_id", ASCENDING),
+                ("updated_at", DESCENDING),
+            ],
+            name="idx_chat_sessions_user_id_repo_id_updated_at",
+        ),
+    ],
+    "csUserRepositories": [
+        IndexModel(
+            [("repo_id", ASCENDING)],
+            name="idx_user_repositories_repo_id",
         ),
     ],
     "csIngestionRequests": [
@@ -89,6 +114,10 @@ _NON_UNIQUE_INDEXES = {
                 "status": {"$in": ["completed", "failed", "cancelled"]},
             },
         ),
+        IndexModel(
+            [("requested_by", ASCENDING), ("created_at", DESCENDING)],
+            name="idx_ingestion_requests_requested_by_created_at",
+        ),
     ],
     "csRefreshTokens": [
         IndexModel(
@@ -113,8 +142,13 @@ _UNIQUE_INDEXES = {
     ],
     "csRepositories": [
         IndexModel(
-            [("owner", ASCENDING), ("repo_name", ASCENDING)],
-            name="ux_repositories_owner_repo_name",
+            [
+                ("owner", ASCENDING),
+                ("repo_name", ASCENDING),
+                ("branch", ASCENDING),
+                ("owner_user_id", ASCENDING),
+            ],
+            name="ux_repositories_owner_repo_name_branch_owner_user_id",
             unique=True,
         ),
     ],
@@ -122,6 +156,23 @@ _UNIQUE_INDEXES = {
         IndexModel(
             [("repo_id", ASCENDING), ("session_id", ASCENDING)],
             name="ux_chat_sessions_repo_id_session_id",
+            unique=True,
+        ),
+        IndexModel(
+            [
+                ("user_id", ASCENDING),
+                ("repo_id", ASCENDING),
+                ("session_id", ASCENDING),
+            ],
+            name="ux_chat_sessions_user_id_repo_id_session_id",
+            unique=True,
+            partialFilterExpression={"user_id": {"$type": "objectId"}},
+        ),
+    ],
+    "csUserRepositories": [
+        IndexModel(
+            [("user_id", ASCENDING), ("repo_id", ASCENDING)],
+            name="ux_user_repositories_user_id_repo_id",
             unique=True,
         ),
     ],
@@ -180,14 +231,20 @@ async def find_duplicate_groups(
     fields: Sequence[str],
     *,
     limit: int = _MAX_DUPLICATE_GROUPS,
+    match: Optional[Dict[str, Any]] = None,
 ) -> DuplicateReport:
-    group_id = {field: f"${field}" for field in fields}
-    pipeline = [
-        {"$group": {"_id": group_id, "count": {"$sum": 1}}},
-        {"$match": {"count": {"$gt": 1}}},
-        {"$sort": {"count": -1}},
-        {"$limit": limit},
-    ]
+    group_id = {field: {"$ifNull": [f"${field}", None]} for field in fields}
+    pipeline: List[Dict[str, Any]] = []
+    if match:
+        pipeline.append({"$match": match})
+    pipeline.extend(
+        [
+            {"$group": {"_id": group_id, "count": {"$sum": 1}}},
+            {"$match": {"count": {"$gt": 1}}},
+            {"$sort": {"count": -1}},
+            {"$limit": limit},
+        ]
+    )
     cursor = await db[collection_name].aggregate(pipeline)
     groups = [
         DuplicateGroup(key=doc.get("_id") or {}, count=int(doc.get("count", 0)))
@@ -199,7 +256,14 @@ async def find_duplicate_groups(
 async def check_duplicates(db: AsyncDatabase) -> List[DuplicateReport]:
     reports = []
     for collection_name, fields in _DUPLICATE_CHECKS:
-        reports.append(await find_duplicate_groups(db, collection_name, fields))
+        reports.append(
+            await find_duplicate_groups(
+                db,
+                collection_name,
+                fields,
+                match=_DUPLICATE_MATCHES.get(collection_name),
+            )
+        )
     return reports
 
 
@@ -232,6 +296,19 @@ async def _create_collection_indexes(
         raise
 
 
+async def _drop_replaced_indexes(db: AsyncDatabase) -> None:
+    """Drop unique indexes replaced by the Day 6 key. Missing indexes are ignored."""
+    for collection_name, names in _INDEXES_TO_DROP.items():
+        for name in names:
+            try:
+                await db[collection_name].drop_index(name)
+                logger.info("Dropped replaced index %s on %s", name, collection_name)
+            except OperationFailure as exc:
+                if getattr(exc, "code", None) not in {26, 27}:
+                    raise
+                logger.debug("Index %s on %s already absent", name, collection_name)
+
+
 async def apply_indexes(db: AsyncDatabase, *, include_unique: bool) -> None:
     for collection_name, models in _NON_UNIQUE_INDEXES.items():
         await _create_collection_indexes(db, collection_name, models)
@@ -241,6 +318,7 @@ async def apply_indexes(db: AsyncDatabase, *, include_unique: bool) -> None:
         logger.warning("Skipping unique indexes because duplicates were found")
         return
 
+    await _drop_replaced_indexes(db)
     for collection_name, models in _UNIQUE_INDEXES.items():
         await _create_collection_indexes(db, collection_name, models)
         logger.info("Ensured unique indexes on %s", collection_name)

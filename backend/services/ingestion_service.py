@@ -432,6 +432,7 @@ class IngestionService:
             "parsing_stats": ParsingStats(**parsing_stats).model_dump() if parsing_stats else None,
             "last_ingested_at": datetime.now(timezone.utc),
             "visibility": "public",
+            "owner_user_id": None,
             "embedding_model": getattr(self.embedder, "model_name", settings.gemini_embedding_model),
             "embedding_dim": getattr(self.embedder, "dim", EMBEDDING_DIM),
             "schema_version": SCHEMA_VERSION,
@@ -501,6 +502,8 @@ class IngestionService:
                 "files_processed": files_processed,
                 "chunks_count": len(chunks),
                 "chunks_with_embeddings": 0,
+                "visibility": "public",
+                "owner_user_id": None,
             }
             existing = await self.mongodb_service.find_repository_by_identifier(
                 owner, repo_name, branch

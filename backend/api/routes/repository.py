@@ -509,6 +509,7 @@ async def ingest_repository(
     mongodb_service: MongoDBService = Depends(get_mongodb_service),
     repository_service: RepositoryService = Depends(get_repository_service),
     job_queue: JobQueue = Depends(get_job_queue),
+    user: dict = Depends(get_current_user),
 ) -> IngestionResponse:
     """
     Create an ingestion request and start processing in the background.
@@ -679,6 +680,7 @@ async def ingest_repository(
                 "cleanup": request.cleanup,
                 "type": "full",
                 "trigger": "user",
+                "requested_by": user["_id"],
                 "progress": {
                     "stage": "queued",
                     "files_total": 0,
